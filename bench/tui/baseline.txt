@@ -1,0 +1,4 @@
+diff+serialize 200x60 full change=0.420
+no-change frame diff=0.095
+paragraph wrap 10k chars=0.680
+parser throughput full corpus x50 (x200)=1.200
