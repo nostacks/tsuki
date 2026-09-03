@@ -2,6 +2,7 @@
 
 import std/[locks, strutils]
 import ../[event, reactor, text]
+import selector, sessionpicker
 
 type
   AgentRole* = enum
@@ -53,11 +54,26 @@ type
     label*: string
     uri*: string
 
+  AttachmentViewState* = enum
+    attachmentViewStaged
+    attachmentViewReady
+    attachmentViewPreviewUnsupported
+    attachmentViewModelUnsupported
+    attachmentViewMissing
+    attachmentViewChanged
+    attachmentViewSending
+    attachmentViewSent
+    attachmentViewFailed
+
   Attachment* = object
     id*: string
     name*: string
     mediaType*: string
     sizeBytes*: int64
+    width*: int
+    height*: int
+    altText*: string
+    state*: AttachmentViewState
 
   RateLimit* = object
     remaining*: int64
@@ -69,6 +85,16 @@ type
     maxAttempts*: int
     delayMs*: int64
     reason*: string
+
+  AgentViewStatus* = object
+    provider*: string
+    model*: string
+    mode*: string
+    message*: string
+    contextUsed*: int64
+    contextLimit*: int64
+    offline*: bool
+    saving*: bool
 
   ApprovalRequest* = object
     id*: string
@@ -116,6 +142,14 @@ type
     agentCitationsUpdated
     agentRateLimitUpdated
     agentRetrying
+    agentStatusUpdated
+    agentSessionReset
+    agentSessionTitleUpdated
+    agentSelectorUpdated
+    agentAuthUpdated
+    agentSessionsUpdated
+    agentAttachmentStaged
+    agentAttachmentDetached
 
   AgentEvent* = object
     kind*: AgentEventKind
@@ -134,6 +168,10 @@ type
     attachments*: seq[Attachment]
     rateLimit*: RateLimit
     retry*: RetryInfo
+    viewStatus*: AgentViewStatus
+    selectorEntries*: seq[SelectorEntry]
+    authEntries*: seq[ProviderAuthEntry]
+    sessionEntries*: seq[SessionPickerEntry]
     banner*: bool
     background*: bool
 
@@ -151,6 +189,14 @@ type
     pendingApproval*: ApprovalRequest
     usage*: Usage
     rateLimit*: RateLimit
+    status*: AgentViewStatus
+    stagedAttachments*: seq[Attachment]
+    selectorEntries*: seq[SelectorEntry]
+    authEntries*: seq[ProviderAuthEntry]
+    sessionEntries*: seq[SessionPickerEntry]
+    selectorLoaded*: bool
+    authLoaded*: bool
+    sessionsLoaded*: bool
     active*: bool
     cancelled*: bool
     transcriptRevision*: uint64
@@ -256,6 +302,30 @@ func rateLimitUpdated*(value: RateLimit): AgentEvent =
 func retrying*(turnId: string, info: RetryInfo): AgentEvent =
   AgentEvent(kind: agentRetrying, id: turnId, retry: info)
 
+func statusUpdated*(status: AgentViewStatus): AgentEvent =
+  AgentEvent(kind: agentStatusUpdated, viewStatus: status)
+
+func sessionReset*(sessionId, title: string): AgentEvent =
+  AgentEvent(kind: agentSessionReset, id: sessionId, text: title)
+
+func sessionTitleUpdated*(sessionId, title: string): AgentEvent =
+  AgentEvent(kind: agentSessionTitleUpdated, id: sessionId, text: title)
+
+func selectorUpdated*(entries: seq[SelectorEntry]): AgentEvent =
+  AgentEvent(kind: agentSelectorUpdated, selectorEntries: entries)
+
+func authUpdated*(entries: seq[ProviderAuthEntry]): AgentEvent =
+  AgentEvent(kind: agentAuthUpdated, authEntries: entries)
+
+func sessionsUpdated*(entries: seq[SessionPickerEntry]): AgentEvent =
+  AgentEvent(kind: agentSessionsUpdated, sessionEntries: entries)
+
+func attachmentStaged*(attachment: Attachment): AgentEvent =
+  AgentEvent(kind: agentAttachmentStaged, attachments: @[attachment])
+
+func attachmentDetached*(id: string): AgentEvent =
+  AgentEvent(kind: agentAttachmentDetached, id: id)
+
 func canCoalesce(previous, next: AgentEvent): bool =
   previous.kind == next.kind and previous.id == next.id and
     next.kind in {agentThinkingDelta, agentMessageDelta, agentToolOutput}
@@ -296,7 +366,33 @@ func eventFootprint(event: AgentEvent, limit: int): int =
     addString attachment.id
     addString attachment.name
     addString attachment.mediaType
+    addString attachment.altText
   addString event.retry.reason
+  addString event.viewStatus.provider
+  addString event.viewStatus.model
+  addString event.viewStatus.mode
+  addString event.viewStatus.message
+  for entry in event.selectorEntries:
+    addAmount 64
+    addString entry.providerId
+    addString entry.providerName
+    addString entry.modelId
+    addString entry.displayName
+    addString entry.reason
+  for entry in event.authEntries:
+    addAmount 64
+    addString entry.providerId
+    addString entry.providerName
+    addString entry.credentialEnv
+    addString entry.detail
+  for entry in event.sessionEntries:
+    addAmount 64
+    addString entry.id
+    addString entry.title
+    addString entry.workspace
+    addString entry.updatedLabel
+    addString entry.providerModel
+    addString entry.diagnostic
 
 proc post*(chat: AgentChat, posted: sink AgentEvent): bool =
   ## Posts safely from a worker. Count and byte bounds apply before adjacent
@@ -439,7 +535,9 @@ proc safeAttachments(values: openArray[Attachment]): seq[Attachment] =
       plainTextPolicy(maxBytes = 4096)), name: sanitizeText(value.name,
       plainTextPolicy(maxBytes = 4096)), mediaType: sanitizeText(
       value.mediaType, plainTextPolicy(maxBytes = 128)),
-      sizeBytes: max(0'i64, value.sizeBytes))
+      sizeBytes: max(0'i64, value.sizeBytes), width: max(0, value.width),
+      height: max(0, value.height), altText: sanitizeText(value.altText,
+      plainTextPolicy(maxBytes = 4096)), state: value.state)
 
 proc apply*(chat: AgentChat, event: AgentEvent) =
   ## Applies one event on the UI thread, preserving stable IDs and versions.
@@ -452,6 +550,7 @@ proc apply*(chat: AgentChat, event: AgentEvent) =
       attachments: safeAttachments(event.attachments))
     chat.active = true
     chat.cancelled = false
+    chat.stagedAttachments.setLen 0
   of agentThinkingDelta, agentMessageDelta:
     let itemKind = if event.kind == agentThinkingDelta: transcriptThinking
       else: transcriptMessage
@@ -554,6 +653,99 @@ proc apply*(chat: AgentChat, event: AgentEvent) =
       $event.retry.attempt, kind: transcriptNotice, role: roleSystem,
       title: "Retrying", content: sanitizeText(event.retry.reason),
       expanded: true, version: 1, retryable: true)
+  of agentStatusUpdated:
+    chat.status = AgentViewStatus(
+      provider: sanitizeText(event.viewStatus.provider,
+        plainTextPolicy(maxBytes = 256)),
+      model: sanitizeText(event.viewStatus.model,
+        plainTextPolicy(maxBytes = 1024)),
+      mode: sanitizeText(event.viewStatus.mode,
+        plainTextPolicy(maxBytes = 128)),
+      message: sanitizeText(event.viewStatus.message,
+        plainTextPolicy(maxBytes = 1024)),
+      contextUsed: max(0'i64, event.viewStatus.contextUsed),
+      contextLimit: max(0'i64, event.viewStatus.contextLimit),
+      offline: event.viewStatus.offline, saving: event.viewStatus.saving)
+  of agentSessionReset:
+    chat.items.setLen 0
+    chat.plan.setLen 0
+    chat.pendingApproval = ApprovalRequest()
+    chat.stagedAttachments.setLen 0
+    chat.title = sanitizeText(event.text, plainTextPolicy(maxBytes = 1024))
+    chat.sessionId = sanitizeText(event.id,
+      plainTextPolicy(maxBytes = 4096))
+    chat.active = false
+    chat.cancelled = false
+    chat.transcriptRevision = 0
+    chat.changeCount = 0
+    chat.changeStart = 0
+  of agentSessionTitleUpdated:
+    if event.id == chat.sessionId:
+      chat.title = sanitizeText(event.text, plainTextPolicy(maxBytes = 1024))
+  of agentSelectorUpdated:
+    chat.selectorEntries.setLen 0
+    for entry in event.selectorEntries:
+      chat.selectorEntries.add SelectorEntry(
+        providerId: sanitizeText(entry.providerId,
+          plainTextPolicy(maxBytes = 256)),
+        providerName: sanitizeText(entry.providerName,
+          plainTextPolicy(maxBytes = 512)),
+        modelId: sanitizeText(entry.modelId,
+          plainTextPolicy(maxBytes = 1024)),
+        displayName: sanitizeText(entry.displayName,
+          plainTextPolicy(maxBytes = 1024)),
+        imageInput: entry.imageInput, tools: entry.tools,
+        available: entry.available,
+        reason: sanitizeText(entry.reason,
+          plainTextPolicy(maxBytes = 2048)))
+    chat.selectorLoaded = true
+  of agentAuthUpdated:
+    chat.authEntries.setLen 0
+    for entry in event.authEntries:
+      chat.authEntries.add ProviderAuthEntry(
+        providerId: sanitizeText(entry.providerId,
+          plainTextPolicy(maxBytes = 256)),
+        providerName: sanitizeText(entry.providerName,
+          plainTextPolicy(maxBytes = 512)),
+        kind: entry.kind, status: entry.status,
+        credentialEnv: sanitizeText(entry.credentialEnv,
+          plainTextPolicy(maxBytes = 256)),
+        detail: sanitizeText(entry.detail,
+          plainTextPolicy(maxBytes = 2048)))
+    chat.authLoaded = true
+  of agentSessionsUpdated:
+    chat.sessionEntries.setLen 0
+    for entry in event.sessionEntries:
+      chat.sessionEntries.add SessionPickerEntry(
+        id: sanitizeText(entry.id, plainTextPolicy(maxBytes = 4096)),
+        title: sanitizeText(entry.title, plainTextPolicy(maxBytes = 4096)),
+        workspace: sanitizeText(entry.workspace,
+          plainTextPolicy(maxBytes = 32 * 1024)),
+        updatedLabel: sanitizeText(entry.updatedLabel,
+          plainTextPolicy(maxBytes = 256)),
+        providerModel: sanitizeText(entry.providerModel,
+          plainTextPolicy(maxBytes = 2048)),
+        interrupted: entry.interrupted, corrupt: entry.corrupt,
+        diagnostic: sanitizeText(entry.diagnostic,
+          plainTextPolicy(maxBytes = 4096)))
+    chat.sessionsLoaded = true
+  of agentAttachmentStaged:
+    let values = safeAttachments(event.attachments)
+    if values.len > 0:
+      var replaced = false
+      for attachment in chat.stagedAttachments.mitems:
+        if attachment.id == values[0].id:
+          attachment = values[0]
+          replaced = true
+          break
+      if not replaced:
+        chat.stagedAttachments.add values[0]
+  of agentAttachmentDetached:
+    let safeId = sanitizeText(event.id, plainTextPolicy(maxBytes = 4096))
+    for index in countdown(chat.stagedAttachments.len - 1, 0):
+      if chat.stagedAttachments[index].id == safeId:
+        chat.stagedAttachments.delete(index)
+        break
 
 proc drain*(chat: AgentChat, maxEvents = 256): int =
   ## Applies a bounded event batch and returns the number consumed. If work

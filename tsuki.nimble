@@ -19,6 +19,8 @@ skipDirs      = @["bench", "build", "doc", "examples", "nimcache", "tests",
 
 requires "nim >= 2.2.0"
 
+switch("define", "ssl")
+
 proc prepareBuildDir(directory: string) =
   mkDir("build/" & directory)
 
@@ -26,6 +28,8 @@ proc prepareBuildDir(directory: string) =
 task test, "run the debug and release test suites":
   prepareBuildDir("tests")
   exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-basic --out:build/tests/basic tests/test1.nim"
+  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-agent --out:build/tests/agent tests/agent/all.nim"
+  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-codex-local --out:build/tests/codex-local tests/agent/codex_local.nim"
   exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-debug --out:build/tests/tui-debug tests/tui/all.nim"
   exec "nim c -r --threads:on -d:release --path:src --nimcache:build/nimcache/test-release --out:build/tests/tui-release tests/tui/all.nim"
 
@@ -36,6 +40,14 @@ task testFresh, "audit clean-checkout inputs and run the full suite":
     if not fileExists(fixture):
       raise newException(IOError, "missing test fixture: " & fixture)
   exec "nimble test"
+
+task testProviderLocal, "run the opt-in loopback provider transport fixture":
+  prepareBuildDir("tests")
+  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-provider-local --out:build/tests/provider-local tests/agent/openai_local.nim"
+
+task testCodexLocal, "run the local Codex App Server protocol fixture":
+  prepareBuildDir("tests")
+  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-codex-local --out:build/tests/codex-local tests/agent/codex_local.nim"
 
 task testWindows, "run the platform test suite on a native Windows host":
   when defined(windows):
@@ -56,6 +68,7 @@ task lint, "format and check all public Nim modules":
   exec "nim check --threads:on --path:src src/tsuki/tui/expert.nim"
 
 task docs, "build he3 API documentation":
+  exec "nim doc --threads:on --path:src --outdir:doc/htmldocs/product src/tsuki/agent.nim"
   exec "nim doc --path:src --outdir:doc/htmldocs src/tsuki/tui.nim"
   exec "nim doc --threads:on --path:src --outdir:doc/htmldocs src/tsuki/tui/agent.nim"
 

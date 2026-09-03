@@ -64,8 +64,10 @@ proc detectCapabilities*(identity = envIdentity(),
     program in ["ghostty", "iterm.app"]
   result.hyperlinks = result.colorDepth != colorNone and
     (program in ["iterm.app", "wezterm", "ghostty"] or "kitty" in term)
-  # External effects remain disabled until an application explicitly opts in.
-  result.clipboard = false
+  # OSC 52 works in the terminals below; every write still requires the
+  # application's explicit copy call.
+  result.clipboard = result.colorDepth != colorNone and
+    (program in ["iterm.app", "wezterm", "ghostty"] or "kitty" in term)
   result.kittyGraphics = "kitty" in term or program == "ghostty"
   result.sixelGraphics = "sixel" in term
   result.itermImages = program == "iterm.app"

@@ -75,6 +75,11 @@ approvals. `AgentChat` owns presentation state, not
 model transport, authentication, tools, or authority policy. See
 `examples/agent_chat.nim` for an end-to-end mock workflow.
 
+The product-level [agent guide](agent.md) documents provider configuration,
+durable sessions, commands, explicit attachments, and the read-only tool
+boundary. [Phase 1 architecture decisions](architecture-phase1.md) record the
+ownership split, fixed bounds, platform paths, and evidence matrix.
+
 ## Examples
 
 There are exactly three maintained examples: `hello_world.nim` introduces the

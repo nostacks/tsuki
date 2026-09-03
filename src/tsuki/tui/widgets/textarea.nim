@@ -189,6 +189,35 @@ proc textareaEvent*(state: var TextareaState, event: Event,
       state.remember()
       discard state.deleteSelection()
       return taChanged
+    of Rune(ord('u')):
+      # Readline unix-line-discard: clears the whole draft, undoable.
+      if readOnly or state.content.len == 0: return taIgnored
+      state.remember()
+      state.content = ""
+      state.cursor = 0
+      state.selectionAnchor = -1
+      state.preferredColumn = -1
+      return taChanged
+    of Rune(ord('k')):
+      # Readline kill-to-end.
+      if readOnly or state.cursor >= items.len: return taIgnored
+      state.remember()
+      discard state.deleteSelection()
+      state.content = splice(state.content, state.cursor, items.len, "")
+      state.selectionAnchor = -1
+      return taChanged
+    of Rune(ord('w')):
+      # Readline backward-kill-word.
+      if readOnly or state.cursor <= 0: return taIgnored
+      state.remember()
+      if not state.deleteSelection() and state.cursor > 0:
+        var cut = state.cursor
+        while cut > 0 and items[cut - 1].runeAt(0).isWhiteSpace: dec cut
+        while cut > 0 and not items[cut - 1].runeAt(0).isWhiteSpace: dec cut
+        state.content = splice(state.content, cut, state.cursor, "")
+        state.cursor = cut
+      state.selectionAnchor = -1
+      return taChanged
     of Rune(ord('z')):
       if readOnly: return taIgnored
       return if state.restore(state.undoStack, state.redoStack): taChanged
@@ -199,7 +228,10 @@ proc textareaEvent*(state: var TextareaState, event: Event,
         else: taIgnored
     else: discard
   if key.code == kcEnter:
-    if submitOnEnter and not shift: return taSubmit
+    # Shift-Enter and Alt/Option-Enter insert a newline: kitty-capable
+    # terminals report Shift-Enter distinctly, while legacy terminals that
+    # cannot distinguish it still offer the Alt-Enter path.
+    if submitOnEnter and not (shift or modAlt in key.mods): return taSubmit
     if readOnly: return taIgnored
     state.remember()
     state.replaceSelection("\n")

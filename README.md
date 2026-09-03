@@ -3,12 +3,9 @@
 Tsuki is a fast, tiny, modular coding agent written in Nim.
 
 > [!WARNING]
-> Tsuki is in pre-alpha and under active development. he3, its terminal UI, is
-> the only part considered ready today. Work is focused on a minimal working
-> agent, and major changes are expected until that prototype is complete.
-
-The current `agent_chat` example demonstrates the interface with mock events.
-It is not a working coding agent yet.
+> Tsuki is in pre-alpha and under active development. The Phase 1 agent is a
+> deliberately bounded vertical slice, provider and terminal compatibility is
+> claimed only where the manual record has evidence.
 
 ## he3
 
@@ -61,6 +58,12 @@ To build a checkout locally:
 nimble build
 ```
 
+Start without credentials and add a key in the app:
+
+```sh
+./build/tsuki --new
+```
+
 ## Examples
 
 The repository keeps three public examples:
@@ -68,9 +71,8 @@ The repository keeps three public examples:
 1. [`hello_world.nim`](examples/hello_world.nim): a minimal he3 application.
 2. [`counter.nim`](examples/counter.nim): state, keyboard input, styling, and a
    testable draw function.
-3. [`agent_chat.nim`](examples/agent_chat.nim): a mock coding-agent interface
-   with streamed output, queued prompts, plans, tools, approvals, and
-   background work.
+3. [`agent_chat.nim`](examples/agent_chat.nim): the public mock provider and
+   real session/controller/TUI integration.
 
 Compile all examples without running the interactive programs:
 

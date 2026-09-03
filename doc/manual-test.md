@@ -40,8 +40,8 @@ Terminal, cmd.exe conhost.
 | 8 | Global quit | Ctrl-Q exits immediately, including while approval is pending |
 | 9 | Wheel scroll | Wheel scrolls the transcript from any focus; composer, divider, and status stay fixed |
 | 10 | Autoscroll | New lines while scrolled to bottom keep the view pinned |
-| 11 | Slash commands | `/help` lists commands, `/clear` empties the transcript, `/quit` exits, unknown commands report quietly |
-| 12 | Slash completion | Typing `/` shows a `⇥` hint; Tab inserts the candidate; repeating Tab cycles |
+| 11 | Slash commands | `/help` lists commands, `/clear` explains durable-history semantics, `/new` starts fresh, `/quit` exits, unknown commands report quietly |
+| 12 | Slash completion | Typing `/` opens the recommended-command popover; arrows move, Tab/Enter complete, and Escape closes it without quitting |
 | 13 | Wide chars/emoji | Paste CJK and emoji; cursor and wrap stay correct |
 | 14 | Multiline paste | Bracketed paste lands in the draft; the composer grows for multiline drafts |
 | 15 | Resize | Resize from 40x12 through 120x30; bottom chrome stays anchored, no artifacts or tearing |
@@ -79,3 +79,35 @@ outstanding.
 The 2026-09-01 live smoke submitted two prompts in one active turn, observed
 the `1 prompt queued` status, streamed and completed the independent workspace
 index, and captured a clean Ctrl-Q terminal restoration.
+
+## Phase 1 product evidence
+
+Automated on the macOS development host on 2026-09-02:
+
+- mock provider through controller, atomic store, restart decode, and TUI event
+  projection;
+- arbitrary SSE/UTF-8 chunk boundaries and bounded event/line rejection;
+- context omission without durable-history mutation;
+- corrupt/future session isolation and interrupted-turn conversion;
+- workspace traversal, secret-like path, binary, and bounded tool checks;
+- forged image extensions, bounded dimensions, Kitty PNG chunking, targeted
+  clear controls, and text attachment cards;
+- searchable provider/model and session views at headless sizes.
+- loopback OpenAI-compatible `/models` discovery, SSE text/usage/rate-limit
+  normalization, clean completion, and unexpected-EOF classification.
+- OpenRouter catalog metadata mapping for names, modalities, tools, context,
+  output limits, and its identifying request header through loopback HTTP.
+- Codex App Server JSONL initialization, ChatGPT device prompt/completion,
+  logout, paginated model discovery, read-only ephemeral thread setup, and
+  normalized streamed deltas through a local subprocess fixture.
+- recommended slash-command popover rendering, non-color selection marker,
+  arrow traversal, Enter completion, and non-quitting Escape behavior.
+
+No GUI terminal was available to verify Kitty placement lifecycle or iTerm
+inline images during this implementation. The executable therefore keeps text
+fallback as its supported behavior and makes no new inline-image compatibility
+claim. A public OpenAI-compatible endpoint smoke test remains opt-in and
+requires an environment-supplied credential; the automated transport fixture
+uses loopback only, and no public service was contacted by the default gate.
+Live OpenRouter and ChatGPT subscription requests are likewise not recorded as
+manual compatibility evidence yet.

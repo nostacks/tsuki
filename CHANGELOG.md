@@ -17,3 +17,17 @@
   examples to automatic lifecycle APIs.
 - Consolidated the public examples into hello world, counter, and one complete
   agent chat workflow.
+- Added the Phase 1 coding-agent executable with versioned configuration,
+  OpenAI-compatible and deterministic mock providers, incremental streaming,
+  cancellation/retry, conservative context projection, and dynamic status.
+- Added canonical multimodal messages, atomic resumable JSON sessions,
+  searchable provider/model and session views, explicit image staging, and a
+  bounded Kitty PNG encoder with universal text fallback.
+- Added workspace-confined read-only list/search/read tools and a persisted
+  multi-round controller tool loop.
+- Added OpenRouter with provider-supplied model metadata and automatic model
+  discovery for every configured provider.
+- Added managed ChatGPT subscription login and model listing through the Codex
+  App Server without exposing Codex OAuth credentials to Tsuki.
+- Replaced the single slash-completion hint with a keyboard-first recommended
+  command popover, including `/login` and `/logout`.

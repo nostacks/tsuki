@@ -3,10 +3,16 @@
 
 import std/[strutils, unicode]
 import ../[event, geometry, graphemes, render, text]
-import ../widgets/[display, textarea]
+import ../widgets/textarea
 import theme
 
 type
+  SlashCommand* = object
+    name*: string
+    usage*: string
+    description*: string
+    recommended*: bool
+
   PromptResultKind* = enum
     promptIgnored
     promptChanged
@@ -21,7 +27,9 @@ type
   PromptState* = object
     editor*: TextareaState
     completions*: seq[string]
+    commands*: seq[SlashCommand]
     completionIndex*: int
+    completionDismissed*: bool
     queued*: seq[string]
     queueHead: int
 
@@ -30,6 +38,21 @@ proc setCompletions*(state: var PromptState, values: openArray[string]) =
   state.completions.setLen 0
   for value in values: state.completions.add sanitizeText(value)
   state.completionIndex = 0
+
+proc setCommands*(state: var PromptState, values: openArray[SlashCommand]) =
+  ## Replaces slash-command metadata used by completion and its popover.
+  state.commands.setLen 0
+  state.completions.setLen 0
+  for value in values:
+    let name = sanitizeText(value.name)
+    if name.len == 0: continue
+    state.commands.add SlashCommand(name: name,
+      usage: sanitizeText(value.usage),
+      description: sanitizeText(value.description),
+      recommended: value.recommended)
+    state.completions.add name
+  state.completionIndex = 0
+  state.completionDismissed = false
 
 proc queuePrompt*(state: var PromptState, value: string,
     maxQueued = 32): bool =
@@ -58,7 +81,7 @@ proc popQueued*(state: var PromptState, value: var string): bool =
     state.queueHead = 0
   true
 
-func slashWord(state: PromptState): tuple[word: string, start: int] =
+func slashWord*(state: PromptState): tuple[word: string, start: int] =
   ## Returns the `/word` under the cursor and its cluster index. The word
   ## starts at the nearest `/` and ends at the cursor or a separator.
   result.start = -1
@@ -79,17 +102,39 @@ func matchingCompletions(state: PromptState, word: string): seq[string] =
   for candidate in state.completions:
     if candidate.startsWith(word): result.add candidate
 
+func slashSuggestions*(state: PromptState): seq[SlashCommand] =
+  ## Returns bounded command metadata for the leading slash word.
+  let (word, start) = state.slashWord
+  if start != 0 or word.len == 0 or state.completionDismissed: return
+  for command in state.commands:
+    if command.name.startsWith(word) and
+        (word != "/" or command.recommended):
+      result.add command
+
+func suggestionsVisible*(state: PromptState): bool =
+  state.slashSuggestions.len > 0
+
+proc dismissSuggestions*(state: var PromptState): bool =
+  ## Closes the current popover without changing or submitting the draft.
+  if not state.suggestionsVisible: return false
+  state.completionDismissed = true
+  true
+
+func selectedSuggestion*(state: PromptState): SlashCommand =
+  let matches = state.slashSuggestions
+  if matches.len > 0:
+    result = matches[clamp(state.completionIndex, 0, matches.high)]
+
 func nextCompletion*(state: PromptState): string =
   ## The candidate Tab would insert right now, or "" when none applies.
   let (word, start) = state.slashWord
   if start < 0: return ""
+  let suggestions = state.slashSuggestions
+  if suggestions.len > 0:
+    return suggestions[clamp(state.completionIndex, 0,
+      suggestions.high)].name
   let matches = state.matchingCompletions(word)
-  if matches.len == 0: return ""
-  let at = matches.find(word)
-  if at >= 0 and matches.len > 1:
-    matches[(at + 1) mod matches.len]
-  else:
-    matches[0]
+  if matches.len > 0: matches[0] else: ""
 
 proc insertCompletion(state: var PromptState): bool =
   ## Replaces the `/word` under the cursor with the next matching completion.
@@ -110,13 +155,24 @@ proc insertCompletion(state: var PromptState): bool =
   state.editor.selectionAnchor = -1
   let matches = state.matchingCompletions(word)
   state.completionIndex = max(0, matches.find(candidate))
+  state.completionDismissed = false
   true
 
 proc promptEvent*(state: var PromptState, event: Event): PromptResult =
   ## Handles multiline editing. Enter submits; Shift-Enter inserts a newline;
   ## Tab completes the `/word` under the cursor.
+  if event.isCancel and state.dismissSuggestions():
+    return PromptResult(kind: promptChanged)
   if event.isCancel:
     return PromptResult(kind: promptCancel)
+  if event.kind == evKey and event.key.mods == {} and
+      event.key.code in {kcUp, kcDown} and state.suggestionsVisible:
+    let count = state.slashSuggestions.len
+    if event.key.code == kcUp:
+      state.completionIndex = (state.completionIndex - 1 + count) mod count
+    else:
+      state.completionIndex = (state.completionIndex + 1) mod count
+    return PromptResult(kind: promptChanged)
   if event.kind == evKey and event.key.isKey(kcTab):
     if state.insertCompletion():
       return PromptResult(kind: promptChanged)
@@ -138,6 +194,14 @@ proc promptEvent*(state: var PromptState, event: Event): PromptResult =
       inc state.editor.cursor
     state.editor.selectionAnchor = -1
     return PromptResult(kind: promptChanged)
+  if event.kind == evKey and event.key.isKey(kcEnter) and
+      state.suggestionsVisible:
+    let (word, unused) = state.slashWord
+    discard unused
+    let selected = state.selectedSuggestion
+    if selected.name.len > 0 and selected.name != word and
+        state.insertCompletion():
+      return PromptResult(kind: promptChanged)
   case state.editor.textareaEvent(event, submitOnEnter = true)
   of taSubmit:
     let submitted = state.editor.content
@@ -151,7 +215,13 @@ proc promptEvent*(state: var PromptState, event: Event): PromptResult =
     PromptResult(kind: promptSubmit, text: submitted)
   of taCopy:
     PromptResult(kind: promptCopy, text: state.editor.selectedText)
-  of taChanged, taMoved:
+  of taChanged:
+    state.completionDismissed = false
+    let count = state.slashSuggestions.len
+    if count == 0: state.completionIndex = 0
+    else: state.completionIndex = clamp(state.completionIndex, 0, count - 1)
+    PromptResult(kind: promptChanged)
+  of taMoved:
     PromptResult(kind: promptChanged)
   of taIgnored:
     PromptResult(kind: promptIgnored)
@@ -159,7 +229,7 @@ proc promptEvent*(state: var PromptState, event: Event): PromptResult =
 proc prompt*(frame: Frame, state: var PromptState, focused = true,
     placeholder = "type a coding request", colors = agentTheme()) =
   ## Draws the composer: a violet leading bar, the multiline editor with a
-  ## visible block cursor, and a quiet slash-completion hint.
+  ## visible block cursor. Command suggestions are drawn by the shell popover.
   if frame.rect.isEmpty: return
   frame.fill(rect(0, 0, 1, frame.rect.height), Rune(0x258C),
     colors.base.accent)
@@ -167,12 +237,3 @@ proc prompt*(frame: Frame, state: var PromptState, focused = true,
     frame.rect.height))
   editor.textarea(state.editor, focused = focused, placeholder = placeholder,
     colors = colors.base)
-  let candidate = state.nextCompletion
-  let draftWidth = state.editor.content.cellWidth
-  # The hint yields to the draft instead of painting over typed text.
-  if candidate.len > 0 and frame.rect.height > 0 and
-      draftWidth + candidate.cellWidth + 8 <= frame.rect.width:
-    let hint = "⇥ " & candidate
-    let x = max(4, frame.rect.width - hint.cellWidth)
-    frame.write(x, 0, hint.truncateCells(max(0, frame.rect.width - x), true),
-      colors.base.muted)

@@ -138,6 +138,10 @@ proc testExplicitProtocols =
   check modern.colorDepth == colorTrue and modern.kittyGraphics and
     modern.synchronizedOutput,
     "terminal identity hints resolve a modern capability profile"
+  check modern.clipboard,
+    "OSC 52-capable terminals advertise the clipboard protocol"
+  check monochromeCapabilities().clipboard == false,
+    "the lowest-common-denominator profile never writes the clipboard"
   check imageRequest("preview", modern).protocol == imageKitty,
     "advertised image capability selects its modular adapter"
   check beginSynchronizedOutput(modern) == "\e[?2026h" and
@@ -243,7 +247,8 @@ proc testAgentShell =
     state.prompt.editor.content = "/clear"
     state.prompt.editor.cursor = 6
     discard handleShellEvent(chat, state, enter)
-    check chat.items.len == 0, "/clear empties the transcript"
+    check chat.items[^1].content.contains("Use /new"),
+      "/clear preserves durable history and explains the non-destructive path"
     state.prompt.editor.content = "/quit"
     state.prompt.editor.cursor = 5
     check handleShellEvent(chat, state, enter).effect == seQuit,
@@ -276,6 +281,117 @@ proc testAgentShell =
     check state.prompt.pendingPromptCount == 0,
       "dispatch removes the prompt from the visible queue count"
 
+  block slashDialogs:
+    let chat = initAgentChat()
+    var state = initAgentUiState()
+    let outcome = runShellCommand(chat, state, "/model")
+    check outcome.effect == seHostAction and outcome.changed and
+      outcome.actionKind == aaModelSelector,
+      "/model requests the model dialog and reports the change so it renders"
+    let providerOutcome = runShellCommand(chat, state, "/provider")
+    check providerOutcome.effect == seHostAction and
+      providerOutcome.changed and
+      providerOutcome.actionKind == aaProviderSelector,
+      "/provider requests the provider dialog and reports the change"
+    let resumeOutcome = runShellCommand(chat, state, "/resume")
+    check resumeOutcome.changed and
+      resumeOutcome.actionKind == aaSessions,
+      "/resume without an id opens the session picker"
+
+  block multilineComposer:
+    var state = initAgentUiState()
+    let chat = initAgentChat()
+    let shifted = state.prompt.promptEvent(
+      Event(kind: evKey, key: initKey(kcEnter, mods = {modShift})))
+    check shifted.kind == promptChanged and
+      state.prompt.editor.content == "\n",
+      "shift-enter inserts a newline instead of submitting"
+    let alted = state.prompt.promptEvent(
+      Event(kind: evKey, key: initKey(kcEnter, mods = {modAlt})))
+    check alted.kind == promptChanged and
+      state.prompt.editor.content == "\n\n",
+      "alt-enter also inserts a newline for legacy terminals"
+    state.prompt.editor.content = "hello"
+    state.prompt.editor.cursor = 5
+    let submitted = state.prompt.promptEvent(
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check submitted.kind == promptSubmit and submitted.text == "hello",
+      "plain enter still submits the draft"
+
+    block readlineEditing:
+      var editor = initAgentUiState()
+      editor.prompt.editor.content = "hello"
+      editor.prompt.editor.cursor = 5
+      let cleared = editor.prompt.promptEvent(
+        Event(kind: evKey, key: initKey(kcChar, Rune(ord('u')), {modCtrl})))
+      check cleared.kind == promptChanged and
+        editor.prompt.editor.content == "",
+        "ctrl-u clears the draft"
+      let restored = editor.prompt.promptEvent(
+        Event(kind: evKey, key: initKey(kcChar, Rune(ord('z')), {modCtrl})))
+      check restored.kind == promptChanged and
+        editor.prompt.editor.content == "hello",
+        "ctrl-u is undoable"
+      editor.prompt.editor.content = "hello"
+      editor.prompt.editor.cursor = 2
+      discard editor.prompt.promptEvent(
+        Event(kind: evKey, key: initKey(kcChar, Rune(ord('k')), {modCtrl})))
+      check editor.prompt.editor.content == "he",
+        "ctrl-k kills to the end of the draft"
+      editor.prompt.editor.content = "one two"
+      editor.prompt.editor.cursor = 7
+      discard editor.prompt.promptEvent(
+        Event(kind: evKey, key: initKey(kcChar, Rune(ord('w')), {modCtrl})))
+      check editor.prompt.editor.content == "one ",
+        "ctrl-w deletes the word before the cursor"
+
+  block quitConfirmation:
+    let chat = initAgentChat()
+    var state = initAgentUiState()
+    let ctrlC = Event(kind: evKey,
+      key: initKey(kcChar, Rune(ord('c')), {modCtrl}))
+    let first = handleShellEvent(chat, state, ctrlC)
+    check first.effect == seNone and first.changed and state.quitArmed,
+      "the first ctrl-c arms the exit confirmation"
+    var harness = initHeadlessTui(80, 24)
+    let armed = harness.drawShell(chat, state)
+    check armed.contains("press ctrl-c again to exit"),
+      "the armed confirmation is visible on the activity line"
+    let second = handleShellEvent(chat, state, ctrlC)
+    check second.effect == seQuit and not state.quitArmed,
+      "the second ctrl-c inside the window exits"
+    state.quitArmed = false
+    chat.apply userMessage("t", "active turn")
+    let cancel = handleShellEvent(chat, state, ctrlC)
+    check cancel.effect == seCancelTurn and state.quitArmed,
+      "ctrl-c during a turn cancels it and arms the exit confirmation"
+    let exitNow = handleShellEvent(chat, state, ctrlC)
+    check exitNow.effect == seQuit,
+      "the next ctrl-c exits after cancelling the turn"
+
+  block statusProjection:
+    let chat = initAgentChat()
+    chat.apply statusUpdated(AgentViewStatus(provider: "chatgpt",
+      model: "gpt-5.1-codex", mode: "agent", message: "ready",
+      contextUsed: 4_000, contextLimit: 128_000, offline: false))
+    let stale = agentTuiOptions(status = AgentStatus(model: "old",
+      mode: "agent", message: "offline", offline: true))
+    var harness = initHeadlessTui(80, 24)
+    var state = initAgentUiState()
+    state.transcript.scroll.anchor = anchorEnd
+    let snap = harness.drawShell(chat, state, stale)
+    check snap.contains("ready") and not snap.contains("offline"),
+      "a live status replaces the stale startup offline fallback"
+    check snap.contains("ctx 4k/128k (3%)"),
+      "the status bar shows context usage, limit, and percent"
+    let fallback = agentTuiOptions(status = AgentStatus(model: "old",
+      mode: "agent", message: "offline", offline: true))
+    var fallbackState = initAgentUiState()
+    let quiet = initAgentChat()
+    let fallbackSnap = harness.drawShell(quiet, fallbackState, fallback)
+    check fallbackSnap.contains("offline"),
+      "without a live status the startup projection still applies"
+
   block slashCompletion:
     var state = initAgentUiState()
     let chat = initAgentChat()
@@ -288,6 +404,41 @@ proc testAgentShell =
     check state.prompt.editor.content == "/clear " and
       state.prompt.editor.cursor == 7,
       "Tab completes the slash command in place"
+
+    state = initAgentUiState()
+    state.prompt.editor.content = "/"
+    state.prompt.editor.cursor = 1
+    var commandHarness = initHeadlessTui(80, 24)
+    let commandFrame = commandHarness.drawShell(chat, state, options)
+    check commandFrame.contains("Recommended commands") and
+      commandFrame.contains("Sign in with ChatGPT"),
+      "a leading slash opens the concise recommended command popover"
+    check commandFrame.contains("↑↓ move") and commandFrame.contains("›"),
+      "the popover exposes keyboard help and a non-color selection marker"
+    discard handleShellEvent(chat, state,
+      Event(kind: evKey, key: initKey(kcDown)))
+    check state.prompt.completionIndex == 1,
+      "plain arrows move the popover selection"
+    let chosen = handleShellEvent(chat, state,
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check chosen.effect == seNone and chosen.changed and
+      state.prompt.editor.content == "/sessions ",
+      "Enter completes a partial selected command before it can run"
+    state.prompt.editor.content = "/"
+    state.prompt.editor.cursor = 1
+    state.prompt.completionDismissed = false
+    let closed = handleShellEvent(chat, state,
+      Event(kind: evKey, key: initKey(kcEscape)))
+    check closed.effect == seNone and closed.changed and
+      state.prompt.completionDismissed,
+      "Escape closes command suggestions without quitting the shell"
+    state.prompt.editor.content = "/login"
+    state.prompt.editor.cursor = 6
+    state.prompt.completionDismissed = false
+    let login = handleShellEvent(chat, state,
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check login.effect == seHostAction and login.actionKind == aaLogin,
+      "the ChatGPT login command reaches the host only when submitted exactly"
 
   block wide120x32:
     let chat = seededShellChat()
@@ -442,23 +593,21 @@ proc testAgentShell =
       button: 0, x: 10, y: 1))
     let drag = Event(kind: evMouse, mouse: MouseEvent(action: maDrag,
       button: 0, x: 30, y: 4))
-    let release = Event(kind: evMouse, mouse: MouseEvent(action: maRelease,
-      button: 0, x: 30, y: 4))
     check handleShellEvent(chat, state, press).changed,
       "a mouse press starts a selection"
     discard handleShellEvent(chat, state, drag)
-    discard handleShellEvent(chat, state, release)
     check state.transcript.hasSelection, "dragging extends the selection"
-    let copied = handleShellEvent(chat, state,
+    let release = handleShellEvent(chat, state,
+      Event(kind: evMouse, mouse: MouseEvent(action: maRelease,
+        button: 0, x: 30, y: 4)))
+    check release.effect == seCopy and release.text.len > 0,
+      "releasing a selection copies it immediately"
+    check state.transcript.hasSelection,
+      "the copied highlight stays visible until the next press"
+    let armQuit = handleShellEvent(chat, state,
       Event(kind: evKey, key: initKey(kcChar, Rune(ord('c')), {modCtrl})))
-    check copied.effect == seCopy and copied.text.len > 0,
-      "ctrl-c copies the selected transcript rows"
-    check not state.transcript.hasSelection,
-      "copying clears the selection"
-    let cancel = handleShellEvent(chat, state,
-      Event(kind: evKey, key: initKey(kcChar, Rune(ord('c')), {modCtrl})))
-    check cancel.effect == seCancelTurn,
-      "ctrl-c without a selection still cancels the active turn"
+    check armQuit.effect == seNone and state.quitArmed,
+      "ctrl-c arms the exit confirmation instead of copying"
 
   block resizeAnchoring:
     let chat = seededShellChat()
@@ -475,9 +624,169 @@ proc testAgentShell =
     check rows[29].contains("agent") and rows[27].contains("▌"),
       "resize preserves composer and status anchoring"
 
+proc testPhase1Views =
+  let models = @[
+    SelectorEntry(providerId: "local", providerName: "Local",
+      modelId: "text", displayName: "Text model",
+      imageInput: selectorUnsupported, tools: selectorSupported,
+      available: true),
+    SelectorEntry(providerId: "local", providerName: "Local",
+      modelId: "vision", displayName: "Vision model",
+      imageInput: selectorUnknown, tools: selectorUnknown,
+      reason: "Discovery is offline")]
+  block selectorWideAndNarrow:
+    var state: SelectorState
+    var harness = initHeadlessTui(80, 24)
+    harness.draw proc (frame: var Frame) =
+      frame.modelSelector(models, state)
+    check harness.snapshot.contains("no image") and
+      harness.snapshot.contains("tools"),
+      "model capabilities have non-color text labels"
+    harness.resize(40, 12)
+    harness.draw proc (frame: var Frame) =
+      frame.modelSelector(models, state)
+    check harness.snapshot.contains("Select provider") and
+      harness.snapshot.contains("enter select"),
+      "the selector keeps identity and keyboard help at 40x12"
+    let down = state.selectorEvent(models,
+      Event(kind: evKey, key: initKey(kcDown)))
+    check down.kind == selectorChanged and state.selected == 1,
+      "arrow traversal is semantic"
+    let unavailable = state.selectorEvent(models,
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check unavailable.kind == selectorIgnored,
+      "an unavailable model does not replace the prior selection"
+    discard state.selectorEvent(models,
+      Event(kind: evKey, key: initKey(kcChar, Rune(ord('v')))))
+    check state.selectedProviderId == "local" and
+      state.selectedModelId == "vision" and state.selected == 0,
+      "filtering retains the selected model identity"
+    discard state.selectorEvent(models,
+      Event(kind: evKey, key: initKey(kcBackspace)))
+    check state.selected == 1,
+      "clearing the filter restores the selected model position"
+
+  block selectorOverlay:
+    let chat = initAgentChat()
+    var state = initAgentUiState()
+    state.overlay = overlayModels
+    let options = agentTuiOptions(selectorEntries = models)
+    var harness = initHeadlessTui(80, 24)
+    let snapshot = harness.drawShell(chat, state, options)
+    check snapshot.contains("Select provider and model") and
+      not snapshot.contains("enter send"),
+      "the modal selector owns the shell while open"
+
+  block providerAuthDialog:
+    let auth = @[
+      ProviderAuthEntry(providerId: "chatgpt",
+        providerName: "ChatGPT (Codex subscription)",
+        kind: providerAuthDevice, status: providerAuthUnknown,
+        detail: "Sign-in is managed by the Codex CLI"),
+      ProviderAuthEntry(providerId: "openai", providerName: "OpenAI",
+        kind: providerAuthApiKey, status: providerAuthMissing,
+        credentialEnv: "OPENAI_API_KEY")]
+    let chat = initAgentChat()
+    var state = initAgentUiState()
+    let options = agentTuiOptions(authEntries = auth)
+    var harness = initHeadlessTui(80, 24)
+    state.overlay = overlayProviders
+    let opened = harness.drawShell(chat, state, options)
+    check opened.contains("Provider sign-in") and
+      opened.contains("enter to sign in") and
+      opened.contains("enter to add API key"),
+      "the provider dialog offers only sign-in actions"
+    check opened.contains("set OPENAI_API_KEY to persist"),
+      "missing keys name their environment variable for persistence"
+    discard handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcDown)))
+    discard handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check state.auth.keyEntry,
+      "an API key provider opens the masked key editor"
+    let keyFrame = harness.drawShell(chat, state, options)
+    check keyFrame.contains("API key for OpenAI"),
+      "the key editor names its provider"
+    discard handleOverlayEvent(chat, state, options,
+      Event(kind: evPaste, text: "sk-pasted-1234"))
+    let pastedFrame = harness.drawShell(chat, state, options)
+    check state.auth.keyEditor.content == "sk-pasted-1234" and
+      pastedFrame.contains("••••••••••••••"),
+      "paste feeds the masked key editor and renders bullets"
+    let submitted = handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check submitted.effect == seHostAction and
+      submitted.actionKind == aaApiKey and
+      submitted.argument == "openai\nsk-pasted-1234",
+      "saving returns the provider and pasted key to the host"
+    check not state.auth.keyEntry,
+      "the dialog returns to the provider list after saving"
+    state.auth = ProviderAuthUi()
+    let device = handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check device.effect == seHostAction and
+      device.actionKind == aaLogin and device.argument == "chatgpt" and
+      state.overlay == overlayNone,
+      "enter on a device provider requests its sign-in and closes the dialog"
+    state.overlay = overlayProviders
+    let cancelled = handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcEscape)))
+    check cancelled.changed and state.overlay == overlayNone,
+      "escape closes the provider dialog"
+
+  block sessionStates:
+    let sessions = @[
+      SessionPickerEntry(id: "s-one", title: "Interrupted work",
+        workspace: "/workspace", updatedLabel: "now",
+        providerModel: "mock/model", interrupted: true),
+      SessionPickerEntry(id: "bad", title: "Corrupt session",
+        corrupt: true, diagnostic: "truncated JSON")]
+    var state: SessionPickerState
+    var harness = initHeadlessTui(80, 24)
+    harness.draw proc (frame: var Frame) =
+      frame.sessionPicker(sessions, state)
+    check harness.snapshot.contains("interrupted") and
+      harness.snapshot.contains("ctrl-a archive"),
+      "session recovery and archive confirmation are explicit text"
+    let arm = state.sessionPickerEvent(sessions,
+      Event(kind: evKey, key: initKey(kcChar, Rune(ord('a')), {modCtrl})))
+    check arm.kind == sessionChanged and state.archiveArmed,
+      "archive needs an explicit first keypress"
+    let confirm = state.sessionPickerEvent(sessions,
+      Event(kind: evKey, key: initKey(kcChar, Rune(ord('a')), {modCtrl})))
+    check confirm.kind == sessionArchiveRequested,
+      "the repeated archive key confirms the exact selected session"
+    discard state.sessionPickerEvent(sessions,
+      Event(kind: evKey, key: initKey(kcChar, Rune(ord('r')), {modCtrl})))
+    check state.renaming, "rename enters a focused title editor"
+    discard state.sessionPickerEvent(sessions,
+      Event(kind: evKey, key: initKey(kcChar, Rune(ord('N')))))
+    let renamed = state.sessionPickerEvent(sessions,
+      Event(kind: evKey, key: initKey(kcEnter)))
+    check renamed.kind == sessionRename and renamed.title == "N",
+      "rename returns the exact session and sanitized new title"
+    discard state.sessionPickerEvent(sessions,
+      Event(kind: evKey, key: initKey(kcDown)))
+    let corruptArchive = state.sessionPickerEvent(sessions,
+      Event(kind: evKey, key: initKey(kcChar, Rune(ord('a')), {modCtrl})))
+    check corruptArchive.kind == sessionIgnored,
+      "corrupt diagnostics cannot be archived as session identities"
+
+  block attachmentFallback:
+    var harness = initHeadlessTui(40, 3)
+    harness.draw proc (frame: var Frame) =
+      frame.attachmentCard(Attachment(id: "a", name: "safe.png",
+        mediaType: "image/png", sizeBytes: 2048),
+        state = cardPreviewUnsupported, dimensions = "20×10",
+        altText = "diagram")
+    check harness.snapshot.contains("Image") and
+      harness.snapshot.contains("Alt: diagram"),
+      "unsupported terminals retain a meaningful attachment card"
+
 testStreamingMarkdown()
 testAgentModel()
 testTranscriptAndApproval()
 testAgentShell()
 testExplicitProtocols()
+testPhase1Views()
 echo "agent ok"
