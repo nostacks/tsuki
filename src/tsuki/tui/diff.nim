@@ -1,60 +1,51 @@
-import std/unicode
 import style
 import buffer
 import private/writer
-import private/ansi
-
-func isBlank(cell: Cell): bool {.inline.} =
-  cell.rune == Rune(0x0020) and cell.glyphLen == 0 and
-    not cell.wideTail and cell.style == styleDefault()
 
 proc diffInto*(prev, next: var Buffer, w: var Out) =
   ## Emits the minimal byte stream turning the `prev` frame into `next`:
   ## one cursor move per changed run, style changes inline, trailing blank
-  ## runs collapsed into erase-to-end-of-line.
+  ## runs collapsed into an erase-to-end-of-line. An unchanged frame performs
+  ## no write at all.
   let def = styleDefault()
-  w.frame.setLen 0
+  w.beginFrame()
   var cur = w.curStyle
   var haveCur = w.curValid
+  let sameWidth = prev.width == next.width
   let wd = min(prev.width, next.width)
   let h = min(prev.height, next.height)
   for y in 0 ..< next.height:
-    if y < h and prev.width == next.width and
-        prev.rowFingerprint(y) == next.rowFingerprint(y):
+    let comparable = y < h
+    if comparable and sameWidth and prev.sameRow(next, y):
       continue
+    let contentEnd = next.rowContentEnd(y)
+    let prevBase = y * prev.width
+    let nextBase = y * next.width
     var x = 0
     while x < next.width:
-      if y < h and x < wd and
-          prev.sameCell(y * prev.width + x, next, y * next.width + x):
+      if comparable and x < wd and
+          prev.sameCell(prevBase + x, next, nextBase + x):
         inc x
         continue
       w.frame.addCursorMove(y + 1, x + 1)
       while x < next.width:
-        let c = next.cells[y * next.width + x]
-        if y < h and x < wd and
-            prev.sameCell(y * prev.width + x, next, y * next.width + x):
+        if comparable and x < wd and
+            prev.sameCell(prevBase + x, next, nextBase + x):
           break
-        var trailing = 0
-        while trailing < next.width - x and
-            next.cells[y * next.width +
-              (next.width - 1 - trailing)].isBlank:
-          inc trailing
-        if trailing == next.width - x:
-          if cur != def:
-            w.frame.addSeq "\x1b[0m"
-            cur = def
+        if x >= contentEnd:
+          if not haveCur or cur != def:
+            w.setStyle(cur, haveCur, def)
           w.frame.addSeq "\x1b[K"
           x = next.width
           break
+        let c = next.cells[nextBase + x]
         if c.wideTail:
           inc x
           continue
         if not haveCur or c.style != cur:
-          w.frame.addSeq styleDiffToSeq(c.style, w.truecolor)
-          cur = c.style
-          haveCur = true
+          w.setStyle(cur, haveCur, c.style)
         w.frame.appendGlyphBytes(next, c)
         inc x, max(1, c.cellWidth)
   w.curStyle = cur
   w.curValid = true
-  w.write w.frame
+  w.endFrame()

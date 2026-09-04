@@ -22,15 +22,14 @@ type
     ckIndexed
     ckRgb
   Color* = object
-    case kind*: ColorKind
-    of ckDefault:
-      discard
-    of ckNamed:
-      name*: NamedColor
-    of ckIndexed:
-      index*: range[0..255]
-    of ckRgb:
-      rgb*: array[3, range[0..255]]
+    ## A four-byte terminal color. The payload bytes are meaningful only for
+    ## the active `kind` and are always zero otherwise, so plain object
+    ## equality is exact. Use `named`, `indexed`, and `rgb` to construct
+    ## values and `name`, `index`, and `rgb` to read them.
+    kind*: ColorKind
+    c0: uint8
+    c1: uint8
+    c2: uint8
   Attr* = enum
     attrBold
     attrDim
@@ -48,72 +47,71 @@ type
     color16
     color256
     colorTrue
-func `==`*(a, b: Color): bool =
-  ## Compares two colors by kind and kind-specific payload.
-  if a.kind != b.kind:
-    return false
-  case a.kind
-  of ckDefault:
-    true
-  of ckNamed:
-    a.name == b.name
-  of ckIndexed:
-    a.index == b.index
-  of ckRgb:
-    a.rgb == b.rgb
 
+static:
+  doAssert sizeof(Color) == 4, "Color must stay a packed four-byte value"
 
-func styleDefault*(): Style =
+func styleDefault*(): Style {.inline.} =
   ## Returns a style with default colors and no attributes.
   Style()
 
-func rgb*(r, g, b: range[0..255]): Color =
+func rgb*(r, g, b: range[0..255]): Color {.inline.} =
   ## Creates an RGB color.
-  Color(kind: ckRgb, rgb: [r, g, b])
+  Color(kind: ckRgb, c0: uint8(r), c1: uint8(g), c2: uint8(b))
 
-func indexed*(i: range[0..255]): Color =
+func indexed*(i: range[0..255]): Color {.inline.} =
   ## Creates a 256-palette indexed color.
-  Color(kind: ckIndexed, index: i)
+  Color(kind: ckIndexed, c0: uint8(i))
 
-func named*(n: NamedColor): Color =
+func named*(n: NamedColor): Color {.inline.} =
   ## Creates a named color.
-  Color(kind: ckNamed, name: n)
+  Color(kind: ckNamed, c0: uint8(ord(n)))
 
-func fg*(c: Color): Style =
+func name*(c: Color): NamedColor {.inline.} =
+  ## Returns the named palette entry; meaningful only when `kind == ckNamed`.
+  NamedColor(int(c.c0) and 15)
+
+func index*(c: Color): range[0..255] {.inline.} =
+  ## Returns the palette index; meaningful only when `kind == ckIndexed`.
+  range[0..255](int(c.c0))
+
+func rgb*(c: Color): array[3, range[0..255]] {.inline.} =
+  ## Returns the RGB channels; meaningful only when `kind == ckRgb`.
+  [range[0..255](int(c.c0)), range[0..255](int(c.c1)),
+    range[0..255](int(c.c2))]
+
+func packed*(c: Color): uint32 {.inline.} =
+  ## Returns the color as one integer for hashing and fast comparison.
+  uint32(ord(c.kind)) or (uint32(c.c0) shl 8) or (uint32(c.c1) shl 16) or
+    (uint32(c.c2) shl 24)
+
+func fg*(c: Color): Style {.inline.} =
   ## Creates a style setting only the foreground color.
-  var s: Style
-  s.fg = c
-  s
+  Style(fg: c)
 
-func bg*(c: Color): Style =
+func bg*(c: Color): Style {.inline.} =
   ## Creates a style setting only the background color.
-  var s: Style
-  s.bg = c
-  s
+  Style(bg: c)
 
-func withFg*(s: Style, c: Color): Style =
+func withFg*(s: Style, c: Color): Style {.inline.} =
   ## Returns `s` with the foreground color replaced.
-  var r = s
-  r.fg = c
-  r
+  result = s
+  result.fg = c
 
-func withBg*(s: Style, c: Color): Style =
+func withBg*(s: Style, c: Color): Style {.inline.} =
   ## Returns `s` with the background color replaced.
-  var r = s
-  r.bg = c
-  r
+  result = s
+  result.bg = c
 
-func withAttrs*(s: Style, attrs: set[Attr]): Style =
+func withAttrs*(s: Style, attrs: set[Attr]): Style {.inline.} =
   ## Returns `s` with attributes added.
-  var r = s
-  r.attrs = r.attrs + attrs
-  r
+  result = s
+  result.attrs = s.attrs + attrs
 
-func withoutAttrs*(s: Style, attrs: set[Attr]): Style =
+func withoutAttrs*(s: Style, attrs: set[Attr]): Style {.inline.} =
   ## Returns `s` with attributes removed.
-  var r = s
-  r.attrs = r.attrs - attrs
-  r
+  result = s
+  result.attrs = s.attrs - attrs
 
 func bold*(s: Style): Style =
   ## Returns a bold variant.

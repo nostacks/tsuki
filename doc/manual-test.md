@@ -82,6 +82,13 @@ index, and captured a clean Ctrl-Q terminal restoration.
 
 ## Phase 1 product evidence
 
+Automated on the macOS development host on 2026-09-05: the PTY suites
+(`t03term`, `t06resize`, `t09input`, `t21hardening`) passed in debug and
+release builds after the runtime hardening, covering clean enter/exit, fatal
+signal restoration with the kitty protocol active, resize delivery, staged
+input, and a clean exit when the pty master closes with SIGHUP ignored. No new
+terminal-emulator compatibility is claimed from that run.
+
 Automated on the macOS development host on 2026-09-02:
 
 - mock provider through controller, atomic store, restart decode, and TUI event

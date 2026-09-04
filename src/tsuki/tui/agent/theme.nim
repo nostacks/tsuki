@@ -13,7 +13,7 @@ func onCanvas*(s: Style): Style =
   ## text sits directly on the terminal's own canvas. Painted surfaces stay
   ## reserved for diffs, selection, and focus.
   result = s
-  result.bg = Color(kind: ckDefault)
+  result.bg = Color()
 
 func agentTheme*(base = darkTheme()): AgentTheme =
   ## Derives agent-specific roles from the core semantic theme. Violet remains

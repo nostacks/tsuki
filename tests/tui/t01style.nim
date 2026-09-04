@@ -3,9 +3,14 @@ import tsuki/tui/style
 import tsuki/tui/private/ansi
 
 proc testConstructors =
-  check rgb(1, 2, 3) == Color(kind: ckRgb, rgb: [1, 2, 3]), "rgb ctor"
-  check indexed(42) == Color(kind: ckIndexed, index: 42), "indexed ctor"
-  check named(ncRed) == Color(kind: ckNamed, name: ncRed), "named ctor"
+  let channels = rgb(1, 2, 3).rgb
+  check rgb(1, 2, 3).kind == ckRgb and channels[0] == 1 and channels[1] == 2 and
+    channels[2] == 3, "rgb ctor"
+  check indexed(42).kind == ckIndexed and indexed(42).index == 42,
+    "indexed ctor"
+  check named(ncRed).kind == ckNamed and named(ncRed).name == ncRed,
+    "named ctor"
+  check sizeof(Color) == 4 and sizeof(Style) <= 12, "styles stay compact"
   check styleDefault().fg.kind == ckDefault, "default fg"
   check styleDefault().bg.kind == ckDefault, "default bg"
   check styleDefault().attrs == {}, "default attrs"
@@ -24,14 +29,34 @@ proc testAnsi =
   check ansiFg(indexed(200)) == "\x1b[38;5;200m", "indexed fg"
   check ansiBg(indexed(17)) == "\x1b[48;5;17m", "indexed bg"
   check ansiFg(rgb(255, 0, 0)) == "\x1b[38;5;196m", "rgb fg red"
-  check ansiFg(Color(kind: ckDefault)) == "", "default fg empty"
-  check ansiBg(Color(kind: ckDefault)) == "", "default bg empty"
+  check ansiFg(Color()) == "", "default fg empty"
+  check ansiBg(Color()) == "", "default bg empty"
   check ansiAttrsOn({attrBold, attrUnderline}) == "\x1b[1m\x1b[4m", "attrs on"
   check ansiAttrsOff({attrBold}) == "\x1b[22m", "attrs off bold"
   check ansiAttrsOff({attrItalic}) == "\x1b[23m", "attrs off italic"
   check ansiReset() == "\x1b[0m", "reset"
   let s = styleDefault().withFg(named(ncGreen)).withAttrs({attrBold})
-  check s.styleDiffToSeq == "\x1b[0m\x1b[32m\x1b[1m", "diff seq"
+  check s.styleDiffToSeq == "\x1b[0;32;1m", "diff seq"
+  var frame: seq[byte]
+  frame.addStyleTransition(fg(named(ncRed)), fg(named(ncGreen)))
+  check cast[string](frame) == "\x1b[32m", "color change emits only the color"
+  frame.setLen 0
+  frame.addStyleTransition(fg(named(ncRed)), fg(named(ncRed)).bold)
+  check cast[string](frame) == "\x1b[1m", "attribute add emits only the attr"
+  frame.setLen 0
+  frame.addStyleTransition(fg(named(ncRed)).bold, fg(named(ncRed)))
+  check cast[string](frame) == "\x1b[0;31m", "attribute removal resets"
+  frame.setLen 0
+  frame.addStyleTransition(fg(named(ncRed)), styleDefault())
+  check cast[string](frame) == "\x1b[0m", "return to default resets"
+  frame.setLen 0
+  frame.addStyleTransition(fg(named(ncRed)), fg(named(ncRed)))
+  check frame.len == 0, "identical styles emit nothing"
+  frame.setLen 0
+  frame.addStyleTransition(styleDefault(), bg(rgb(1, 2, 3)).withFg(
+    indexed(9)), truecolor = true)
+  check cast[string](frame) == "\x1b[48;2;1;2;3;38;5;9m",
+    "combined bg and fg change is one sequence"
 
 proc testClosestIndex =
   check closestIndex(0, 0, 0) == 16, "black to cube origin"

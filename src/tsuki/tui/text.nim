@@ -119,7 +119,7 @@ proc addVisibleControl(dest: var string, r: Rune) =
       dest.add hexDigit((v shr shift) and 0xF)
     dest.add ']'
 
-func decodeUtf8(data: string, at: int, r: var Rune): int =
+func decodeUtf8(data: openArray[char], at: int, r: var Rune): int =
   ## Strict UTF-8 decoder. Invalid starts consume one byte so arbitrary input
   ## always makes progress and cannot smuggle a control through overlong UTF-8.
   if at < 0 or at >= data.len:
@@ -158,12 +158,49 @@ func decodeUtf8(data: string, at: int, r: var Rune): int =
   r = Rune(value)
   need
 
+func isSanitized*(input: openArray[char],
+    policy = plainTextPolicy()): bool =
+  ## True when `sanitizeText` would return `input` unchanged: valid UTF-8,
+  ## no controls beyond the newlines and tabs the policy allows, no CR, and
+  ## within the policy's size limits. Render paths use this to skip copying.
+  if policy.maxBytes > 0 and input.len > policy.maxBytes:
+    return false
+  let cpLimit = if policy.maxCodepoints <= 0: high(int) else:
+    policy.maxCodepoints
+  var i = 0
+  var count = 0
+  while i < input.len:
+    let b0 = uint8(input[i])
+    if b0 < 0x80:
+      if b0 < 0x20:
+        if b0 == 0x0A:
+          if not policy.allowNewlines: return false
+        elif b0 == 0x09:
+          if not policy.allowTabs: return false
+        else:
+          return false
+      elif b0 == 0x7F:
+        return false
+      inc i
+    else:
+      var r: Rune
+      let n = decodeUtf8(input, i, r)
+      if n <= 0 or r.isUnsafeControl:
+        return false
+      inc i, n
+    inc count
+    if count >= cpLimit:
+      return false
+  true
+
 proc sanitizeText*(input: string,
     policy = plainTextPolicy()): string =
   ## Sanitizes arbitrary bytes into safe UTF-8. The result never contains ESC,
   ## BEL, C1, bidi overrides, or other terminal controls. CR and CRLF normalize
   ## to LF when newlines are enabled. Size limits truncate at code-point
   ## boundaries and append a visible ellipsis.
+  if input.isSanitized(policy):
+    return input
   let byteLimit = if policy.maxBytes <= 0: input.len else:
     min(input.len, policy.maxBytes)
   let cpLimit = if policy.maxCodepoints <= 0: high(int) else:

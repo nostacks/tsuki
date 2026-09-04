@@ -19,6 +19,7 @@ type ParseState* = object
   maxPasteBytes*: int
   kittyFlags*: int
   kittySeen*: bool
+  deviceAttributesSeen*: bool
 
 func initParseState*(maxSequenceBytes = defaultMaxSequenceBytes,
     maxPasteBytes = defaultMaxPasteBytes): ParseState =
@@ -55,6 +56,17 @@ func keyEvent(code: KeyCode, ch = Rune(0), mods: set[Mod] = {},
     released = false): Event =
   Event(kind: evKey, key: initKey(code, ch, mods, released))
 
+func controlKey(b: byte, mods: set[Mod] = {}): Event =
+  case b
+  of 0x00: keyEvent(kcChar, Rune(ord('@')), {modCtrl} + mods)
+  of 0x01 .. 0x1a:
+    keyEvent(kcChar, Rune(ord('a') + int(b) - 1), {modCtrl} + mods)
+  of 0x1c: keyEvent(kcChar, Rune(ord('\\')), {modCtrl} + mods)
+  of 0x1d: keyEvent(kcChar, Rune(ord(']')), {modCtrl} + mods)
+  of 0x1e: keyEvent(kcChar, Rune(ord('^')), {modCtrl} + mods)
+  of 0x1f: keyEvent(kcChar, Rune(ord('_')), {modCtrl} + mods)
+  else: Event(kind: evNone)
+
 func modSet(v: int): set[Mod] =
   ## Decodes a CSI modifier parameter into modifier flags.
   let m = max(0, v - 1)
@@ -85,11 +97,13 @@ proc feedByte(state: var ParseState, b: byte): bool =
   true
 
 proc take(state: var ParseState, n: int) =
+  if n >= state.buf.len:
+    state.buf.setLen 0
+    return
   for i in n ..< state.buf.len:
     state.buf[i - n] = state.buf[i]
   state.buf.setLen(state.buf.len - n)
-  if state.buf.len > 0:
-    state.t0 = getMonoTime()
+  state.t0 = getMonoTime()
 
 proc parseRune(data: openArray[byte], outRune: var Rune): int =
   ## Decodes one UTF-8 rune, returning byte length, 0 when incomplete,
@@ -130,9 +144,23 @@ proc parseRune(data: openArray[byte], outRune: var Rune): int =
   outRune = Rune(value)
   need
 
-type CsiParam* = tuple[main: int, sub: int]
+type
+  CsiParam* = tuple[main: int, sub: int]
+  CsiParams = object
+    count: int
+    items: array[8, CsiParam]
 
-proc parseParams(data: openArray[byte], outHasQ: var bool): seq[CsiParam] =
+func len(params: CsiParams): int {.inline.} = params.count
+
+func `[]`(params: CsiParams, index: int): CsiParam {.inline.} =
+  params.items[index]
+
+func add(params: var CsiParams, value: CsiParam) {.inline.} =
+  if params.count < params.items.len:
+    params.items[params.count] = value
+    inc params.count
+
+func parseParams(data: openArray[byte], outHasQ: var bool): CsiParams =
   ## Splits CSI parameters on `;` and `:`; empty fields default to 1.
   var cur: CsiParam = (1, 0)
   var field = 0
@@ -160,7 +188,7 @@ proc parseParams(data: openArray[byte], outHasQ: var bool): seq[CsiParam] =
       discard
   result.add cur
 
-func sgrMouse(final: char, b: int, params: seq[CsiParam]): Event =
+func sgrMouse(final: char, b: int, params: CsiParams): Event =
   ## Builds a mouse event from an SGR sequence.
   let x = if params.len >= 2: params[1].main - 1 else: 0
   let y = if params.len >= 3: params[2].main - 1 else: 0
@@ -188,7 +216,7 @@ func sgrMouse(final: char, b: int, params: seq[CsiParam]): Event =
   Event(kind: evMouse, mouse: MouseEvent(action: action, button: button,
     x: x, y: y, mods: mods))
 
-func csiEvent(final: char, params: seq[CsiParam], alt: bool): Event =
+func csiEvent(final: char, params: CsiParams, alt: bool): Event =
   ## Builds an event from a complete CSI sequence, evNone when unknown.
   var mods: set[Mod]
   var released = false
@@ -252,26 +280,52 @@ func ss3Event(final: char, alt: bool): Event =
   else: Event(kind: evNone)
 
 func kittyEvent(code: int, mods: set[Mod], event: int): Event =
-  ## Maps a kitty protocol key event.
+  ## Maps a kitty protocol key event. Functional keys live in the private use
+  ## area and either map to a named key or are dropped; they never become text.
   let released = event == 3
   case code
   of 27: keyEvent(kcEscape, mods = mods, released = released)
-  of 13: keyEvent(kcEnter, mods = mods, released = released)
+  of 13, 57414: keyEvent(kcEnter, mods = mods, released = released)
   of 9: keyEvent(kcTab, mods = mods, released = released)
   of 127: keyEvent(kcBackspace, mods = mods, released = released)
-  of 57399: keyEvent(kcCapsLock, mods = mods, released = released)
-  of 57401: keyEvent(kcNumLock, mods = mods, released = released)
-  of 57428: keyEvent(kcMediaPlay, mods = mods, released = released)
+  of 57358: keyEvent(kcCapsLock, mods = mods, released = released)
+  of 57359: keyEvent(kcScrollLock, mods = mods, released = released)
+  of 57360: keyEvent(kcNumLock, mods = mods, released = released)
+  of 57361: keyEvent(kcPrintScreen, mods = mods, released = released)
+  of 57362: keyEvent(kcPause, mods = mods, released = released)
+  of 57363: keyEvent(kcMenu, mods = mods, released = released)
+  of 57399 .. 57408:
+    keyEvent(kcChar, Rune(ord('0') + code - 57399), mods = mods,
+      released = released)
+  of 57409: keyEvent(kcChar, Rune(ord('.')), mods = mods, released = released)
+  of 57410: keyEvent(kcChar, Rune(ord('/')), mods = mods, released = released)
+  of 57411: keyEvent(kcChar, Rune(ord('*')), mods = mods, released = released)
+  of 57412: keyEvent(kcChar, Rune(ord('-')), mods = mods, released = released)
+  of 57413: keyEvent(kcChar, Rune(ord('+')), mods = mods, released = released)
+  of 57415: keyEvent(kcChar, Rune(ord('=')), mods = mods, released = released)
+  of 57416: keyEvent(kcChar, Rune(ord(',')), mods = mods, released = released)
+  of 57417: keyEvent(kcLeft, mods = mods, released = released)
+  of 57418: keyEvent(kcRight, mods = mods, released = released)
+  of 57419: keyEvent(kcUp, mods = mods, released = released)
+  of 57420: keyEvent(kcDown, mods = mods, released = released)
+  of 57421: keyEvent(kcPageUp, mods = mods, released = released)
+  of 57422: keyEvent(kcPageDown, mods = mods, released = released)
+  of 57423: keyEvent(kcHome, mods = mods, released = released)
+  of 57424: keyEvent(kcEnd, mods = mods, released = released)
+  of 57425: keyEvent(kcInsert, mods = mods, released = released)
+  of 57426: keyEvent(kcDelete, mods = mods, released = released)
+  of 57428, 57430: keyEvent(kcMediaPlay, mods = mods, released = released)
   of 57429: keyEvent(kcMediaPause, mods = mods, released = released)
-  of 57431: keyEvent(kcMediaStop, mods = mods, released = released)
-  of 57432: keyEvent(kcMediaEject, mods = mods, released = released)
-  of 57433: keyEvent(kcMediaPrev, mods = mods, released = released)
-  of 57434: keyEvent(kcMediaNext, mods = mods, released = released)
-  of 57435: keyEvent(kcMediaVolumeUp, mods = mods, released = released)
-  of 57436: keyEvent(kcMediaVolumeDown, mods = mods, released = released)
-  of 57437: keyEvent(kcMediaVolumeMute, mods = mods, released = released)
+  of 57432: keyEvent(kcMediaStop, mods = mods, released = released)
+  of 57435: keyEvent(kcMediaNext, mods = mods, released = released)
+  of 57436: keyEvent(kcMediaPrev, mods = mods, released = released)
+  of 57438: keyEvent(kcMediaVolumeDown, mods = mods, released = released)
+  of 57439: keyEvent(kcMediaVolumeUp, mods = mods, released = released)
+  of 57440: keyEvent(kcMediaVolumeMute, mods = mods, released = released)
   else:
-    if code >= 0x20:
+    if code >= 0x20 and code <= 0x10FFFF and
+        not (code >= 0xD800 and code <= 0xDFFF) and
+        not (code >= 0xE000 and code <= 0xF8FF):
       keyEvent(kcChar, Rune(code), mods = mods, released = released)
     else:
       Event(kind: evNone)
@@ -351,14 +405,15 @@ proc parseComplete(state: var ParseState, events: var seq[Event]): bool =
             button: button, x: mx, y: my, mods: mouseMods(mb)))
           state.take(6)
           return true
-        let params = parseParams(state.buf[2 ..< i], state.kittySeen)
+        let params = parseParams(state.buf.toOpenArray(2, i - 1),
+            state.kittySeen)
         events.add csiEvent(final, params, state.altPending)
         state.altPending = false
         state.take(i + 1)
         return true
       of '~', 'm', 'A', 'B', 'C', 'D', 'H', 'F', 'I', 'O', 'Z':
         var hasQ = false
-        let params = parseParams(state.buf[2 ..< i], hasQ)
+        let params = parseParams(state.buf.toOpenArray(2, i - 1), hasQ)
         if final == '~' and params.len >= 1 and params[0].main == 200:
           state.paste = true
           state.pasteBuf.setLen 0
@@ -373,7 +428,7 @@ proc parseComplete(state: var ParseState, events: var seq[Event]): bool =
         return true
       of 'u':
         var hasQ = false
-        let params = parseParams(state.buf[2 ..< i], hasQ)
+        let params = parseParams(state.buf.toOpenArray(2, i - 1), hasQ)
         if hasQ:
           state.kittySeen = true
           state.kittyFlags = if params.len >= 1: params[0].main else: 0
@@ -384,6 +439,7 @@ proc parseComplete(state: var ParseState, events: var seq[Event]): bool =
         state.take(i + 1)
         return true
       of 'c':
+        state.deviceAttributesSeen = true
         state.take(i + 1)
         return true
       else:
@@ -416,9 +472,8 @@ proc parseComplete(state: var ParseState, events: var seq[Event]): bool =
         of chr(0x7f): ev = keyEvent(kcBackspace, mods = {modAlt})
         of chr(0x1b): ev = keyEvent(kcEscape, mods = {modAlt})
         else:
-          if r >= 0x01 and r <= 0x1a:
-            ev = keyEvent(kcChar, Rune(ord('a') + int(r) - 1),
-              {modAlt, modCtrl})
+          if r < 0x20:
+            ev = controlKey(r, {modAlt})
           else:
             ev = keyEvent(kcChar, Rune(r), {modAlt})
         events.add ev
@@ -441,9 +496,8 @@ proc parseComplete(state: var ParseState, events: var seq[Event]): bool =
     of '\t': ev = keyEvent(kcTab)
     of '\r': ev = keyEvent(kcEnter)
     of '\n': ev = keyEvent(kcChar, Rune(0x0A))
-    of chr(0x00): ev = keyEvent(kcChar, Rune(0x40), {modCtrl})
     else:
-      ev = keyEvent(kcChar, Rune(ord('a') + int(b) - 1), {modCtrl})
+      ev = controlKey(b)
     events.add ev
     state.take(1)
     return true
@@ -478,7 +532,7 @@ proc checkDeadline*(state: var ParseState, events: var seq[Event],
   ## an Escape key; garbage is dropped.
   if state.buf.len == 0 or state.paste:
     return
-  if (now - state.t0).inMilliseconds <= defaultDeadlineMs:
+  if (now - state.t0).inMilliseconds < defaultDeadlineMs:
     return
   if state.buf.len == 1 and state.buf[0] == 0x1b:
     events.add keyEvent(kcEscape)

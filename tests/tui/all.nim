@@ -21,5 +21,6 @@ import t17reactor
 import t18agent
 import t19widgets
 import t20counter
+import t21hardening
 
 {.pop.}

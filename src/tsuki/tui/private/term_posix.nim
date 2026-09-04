@@ -1,4 +1,4 @@
-import std/[posix, termios]
+import std/[os, posix, strutils, termios]
 
 when not declared(SIGWINCH):
   const SIGWINCH* = 28
@@ -42,13 +42,28 @@ proc platRawDisable*(s: var PlatState) =
     discard tcSetAttr(0, TCSANOW, addr s.orig)
     s.rawApplied = false
 
+proc envSize(): tuple[w, h: int] =
+  let columns = getEnv("COLUMNS")
+  let lines = getEnv("LINES")
+  var w = 0
+  var h = 0
+  try:
+    if columns.len > 0: w = parseInt(columns)
+    if lines.len > 0: h = parseInt(lines)
+  except ValueError:
+    discard
+  if w > 0 and h > 0: (w, h) else: (80, 24)
+
 proc platSize*(s: PlatState): tuple[w, h: int] =
-  ## Returns the terminal size in cells via ioctl, 80x24 as fallback.
+  ## Returns the terminal size in cells. Every standard descriptor is tried
+  ## because stdout may be redirected while stdin or stderr is still the tty;
+  ## COLUMNS/LINES and then 80x24 are the fallbacks.
   var ws: WinSize
-  if ioctl(1, tiocgwinsz, addr ws) == 0 and ws.ws_col > 0 and ws.ws_row > 0:
-    (int(ws.ws_col), int(ws.ws_row))
-  else:
-    (80, 24)
+  for fd in [cint(1), cint(0), cint(2)]:
+    if ioctl(fd, tiocgwinsz, addr ws) == 0 and ws.ws_col > 0 and
+        ws.ws_row > 0:
+      return (int(ws.ws_col), int(ws.ws_row))
+  envSize()
 
 proc platRead*(s: PlatState, buf: pointer, len: int): int =
   ## Reads raw stdin bytes, -1 on error.

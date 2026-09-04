@@ -97,6 +97,46 @@ proc benchParser(): Result =
         st.checkDeadline(events, getMonoTime() + initDuration(seconds = 1))
       events.setLen 0
 
+proc benchFrameWrite(): Result =
+  var b = initBuffer(120, 40)
+  var f = initFrame(b, initRect(0, 0, 120, 40))
+  let ascii = "The quick brown fox jumps over the lazy dog 0123456789 " &
+    "and keeps running across the terminal width without stopping."
+  measure("frame write 40 ascii rows", 200) do ():
+    for y in 0 ..< 40:
+      f.write(0, y, ascii, fg(named(ncBlue)))
+
+proc benchFrameWriteCjk(): Result =
+  var b = initBuffer(120, 40)
+  var f = initFrame(b, initRect(0, 0, 120, 40))
+  let mixed = "終端 émoji 👨‍👩‍👧 한국어 テキスト ascii mix 你好世界 " &
+    "ünïcödé wide narrow"
+  measure("frame write 40 mixed-script rows", 200) do ():
+    for y in 0 ..< 40:
+      f.write(0, y, mixed, fg(named(ncBlue)))
+
+proc benchOverlay(): Result =
+  var destination = filledBuffer(200, 60)
+  var popup = initBuffer(60, 20)
+  for y in 0 ..< 20:
+    popup.writeStr(0, y, "popup row é 你好 " & $y, bg(named(ncBlue)))
+  measure("overlay 60x20 popup onto 200x60", 200) do ():
+    destination.overlay(popup, 70, 20)
+
+proc benchStyledDiff(): Result =
+  var previous = initBuffer(200, 60)
+  var next = initBuffer(200, 60)
+  for y in 0 ..< 60:
+    for x in 0 ..< 200:
+      let color = rgb((x * 7) mod 256, (y * 11) mod 256, (x + y) mod 256)
+      next.setCell(x, y, Cell(rune: Rune(ord('a') + (x + y) mod 26),
+        style: fg(color).withBg(indexed((x + y) mod 256))))
+  var output = initFakeOut()
+  output.truecolor = true
+  measure("diff+serialize 200x60 per-cell styles", 50) do ():
+    output.fake.bytes.setLen 0
+    diffInto(previous, next, output)
+
 proc benchTranscript(): Result =
   let chat = initAgentChat(maxHistoryItems = 100_000)
   chat.items = newSeq[TranscriptItem](100_000)
@@ -120,6 +160,10 @@ proc main =
     benchSparseChange(),
     benchParagraph(),
     benchParser(),
+    benchFrameWrite(),
+    benchFrameWriteCjk(),
+    benchOverlay(),
+    benchStyledDiff(),
     benchTranscript(),
   ]
   for r in results:

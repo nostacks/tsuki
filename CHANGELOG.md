@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Hardened the he3 runtime: SIGWINCH now wakes a blocked wait through the
+  reactor pipe, terminal end-of-file ends `runTui` instead of spinning, the
+  fatal-signal restore sequence lives in fixed storage, leaving the terminal
+  resets SGR state, and a resize rewrites the screen once from the next frame.
+- Fixed input decoding: Ctrl with `\`, `]`, `^`, and `_`, the kitty
+  functional-key table (keypad, lock, and media keys), private-use kitty
+  codes never becoming text, a device-attributes reply ending the kitty probe
+  early, and the escape deadline resolving exactly at 50 ms.
+- Made `redrawAt` keep the earliest pending deadline and re-arm later ones,
+  fixed timer waits waking a fraction early, and added `TuiApp.apply` for
+  host-driven loops.
+- Packed `Color` into four bytes (a `Cell` is now 24 bytes instead of 96);
+  `name`, `index`, and `rgb` are accessors and `named`, `indexed`, and `rgb`
+  the constructors.
+- Emit one combined SGR per style transition, written without allocation,
+  with incremental color and attribute changes between cells.
+- Added allocation-free `graphemeSpans`, `textWidth`, and `openArray` cluster
+  writes, a compile-time property table for code points below U+0800, an
+  `isSanitized` fast path that skips copying clean text, allocation-free
+  overlay compositing, and an O(width) diff row tail scan.
+- Enabled DEC synchronized output automatically for terminals that advertise
+  it; empty frames write nothing.
+- Added hardening tests, benchmark cases for frame writes, overlays, and
+  styled diffs, and corrected the kitty corpus codes.
+
 - Named Tsuki's in-repo terminal UI framework he3.
 - Added safe plain/rich text and allowlisted ANSI parsing.
 - Added complete grapheme storage, configurable width policy, and wide-cell

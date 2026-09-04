@@ -26,11 +26,11 @@ type
     cells*: seq[Cell]
     glyphArena*: seq[byte]
     widthPolicy*: WidthPolicy
-    rowVersions: seq[uint64]
-    fingerprintVersions: seq[uint64]
-    rowFingerprints: seq[uint64]
 
-func defaultCell*(): Cell =
+static:
+  doAssert sizeof(Cell) <= 24, "Cell must stay cache-friendly"
+
+func defaultCell*(): Cell {.inline.} =
   ## A blank, one-column cell with default style.
   Cell(rune: Rune(0x0020), displayWidth: 1)
 
@@ -59,10 +59,6 @@ func initBuffer*(w, h: int, widthPolicy = WidthPolicy()): Buffer =
   result.height = max(0, h)
   result.widthPolicy = widthPolicy
   result.cells = newSeq[Cell](result.width * result.height)
-  result.rowVersions = newSeq[uint64](result.height)
-  result.fingerprintVersions = newSeq[uint64](result.height)
-  result.rowFingerprints = newSeq[uint64](result.height)
-  for version in result.rowVersions.mitems: version = 1
   for cell in result.cells.mitems:
     cell = defaultCell()
 
@@ -81,66 +77,39 @@ func glyphBytesEqual(a: Buffer, ac: Cell, b: Buffer, bc: Cell): bool =
   let n = int(ac.glyphLen)
   let ao = int(ac.glyphOffset)
   let bo = int(bc.glyphOffset)
-  if ao < 0 or bo < 0 or ao + n > a.glyphArena.len or
-      bo + n > b.glyphArena.len:
+  if ao + n > a.glyphArena.len or bo + n > b.glyphArena.len:
     return false
   for i in 0 ..< n:
     if a.glyphArena[ao + i] != b.glyphArena[bo + i]:
       return false
   true
 
+func sameCellUnchecked(a: Buffer, ac: Cell, b: Buffer,
+    bc: Cell): bool {.inline.} =
+  if ac.rune != bc.rune or ac.style != bc.style or
+      ac.wideTail != bc.wideTail:
+    return false
+  if ac.displayWidth != bc.displayWidth and ac.cellWidth != bc.cellWidth:
+    return false
+  if ac.glyphLen == 0 and bc.glyphLen == 0:
+    return true
+  glyphBytesEqual(a, ac, b, bc)
+
 func sameCell*(a: Buffer, ai: int, b: Buffer, bi: int): bool =
   ## Compares two cells including complex grapheme bytes across arenas.
   if ai < 0 or ai >= a.cells.len or bi < 0 or bi >= b.cells.len:
     return false
-  let ac = a.cells[ai]
-  let bc = b.cells[bi]
-  if ac.glyphLen == 0 and bc.glyphLen == 0:
-    return ac.rune == bc.rune and ac.style == bc.style and
-      ac.wideTail == bc.wideTail and ac.cellWidth == bc.cellWidth
-  ac.rune == bc.rune and ac.style == bc.style and
-    ac.wideTail == bc.wideTail and ac.cellWidth == bc.cellWidth and
-    glyphBytesEqual(a, ac, b, bc)
+  sameCellUnchecked(a, a.cells[ai], b, b.cells[bi])
 
-proc markRow(b: var Buffer, y: int) {.inline.} =
-  if y >= 0 and y < b.rowVersions.len:
-    inc b.rowVersions[y]
-
-func mix(hash: var uint64, value: uint64) {.inline.} =
-  hash = (hash xor value) * 1099511628211'u64
-
-func mixColor(hash: var uint64, color: Color) =
-  hash.mix uint64(ord(color.kind))
-  case color.kind
-  of ckDefault: discard
-  of ckNamed: hash.mix uint64(ord(color.name))
-  of ckIndexed: hash.mix uint64(color.index)
-  of ckRgb:
-    hash.mix uint64(color.rgb[0])
-    hash.mix uint64(color.rgb[1])
-    hash.mix uint64(color.rgb[2])
-
-proc rowFingerprint*(b: var Buffer, y: int): uint64 =
-  ## Returns a cached content fingerprint used to skip unchanged row scans.
-  if y < 0 or y >= b.height: return 0
-  if b.fingerprintVersions[y] == b.rowVersions[y]:
-    return b.rowFingerprints[y]
-  var hash = 1469598103934665603'u64
-  for x in 0 ..< b.width:
-    let cell = b.cells[y * b.width + x]
-    hash.mix uint64(uint32(cell.rune))
-    hash.mix uint64(cell.cellWidth)
-    hash.mix uint64(ord(cell.wideTail))
-    hash.mixColor cell.style.fg
-    hash.mixColor cell.style.bg
-    hash.mix uint64(cast[uint8](cell.style.attrs))
-    if cell.glyphLen > 0:
-      let first = int(cell.glyphOffset)
-      let last = min(b.glyphArena.len, first + int(cell.glyphLen))
-      for index in first ..< last: hash.mix uint64(b.glyphArena[index])
-  b.rowFingerprints[y] = hash
-  b.fingerprintVersions[y] = b.rowVersions[y]
-  hash
+func sameRow*(a: Buffer, b: Buffer, y: int): bool =
+  ## Compares one full row of two equally wide buffers, glyph bytes included.
+  if a.width != b.width or y < 0 or y >= a.height or y >= b.height:
+    return false
+  let base = y * a.width
+  for x in 0 ..< a.width:
+    if not sameCellUnchecked(a, a.cells[base + x], b, b.cells[base + x]):
+      return false
+  true
 
 func `==`*(a, b: Buffer): bool =
   ## Compares dimensions, styles, and grapheme content, independent of arena
@@ -149,34 +118,36 @@ func `==`*(a, b: Buffer): bool =
       a.cells.len != b.cells.len:
     return false
   for i in 0 ..< a.cells.len:
-    if not sameCell(a, i, b, i):
+    if not sameCellUnchecked(a, a.cells[i], b, b.cells[i]):
       return false
   true
+
+proc addRuneBytes(dest: var seq[byte], value: uint32) {.inline.} =
+  if value < 0x80:
+    dest.add byte(value)
+  elif value < 0x800:
+    dest.add byte(0xC0 or (value shr 6))
+    dest.add byte(0x80 or (value and 0x3F))
+  elif value < 0x10000:
+    dest.add byte(0xE0 or (value shr 12))
+    dest.add byte(0x80 or ((value shr 6) and 0x3F))
+    dest.add byte(0x80 or (value and 0x3F))
+  else:
+    dest.add byte(0xF0 or (value shr 18))
+    dest.add byte(0x80 or ((value shr 12) and 0x3F))
+    dest.add byte(0x80 or ((value shr 6) and 0x3F))
+    dest.add byte(0x80 or (value and 0x3F))
 
 proc appendGlyphBytes*(dest: var seq[byte], b: Buffer, cell: Cell) =
   ## Appends a head cell's exact UTF-8 grapheme bytes to `dest`.
   if cell.wideTail:
     return
   if cell.glyphLen == 0:
-    let value = uint32(cell.rune)
-    if value < 0x80:
-      dest.add byte(value)
-    elif value < 0x800:
-      dest.add byte(0xC0 or (value shr 6))
-      dest.add byte(0x80 or (value and 0x3F))
-    elif value < 0x10000:
-      dest.add byte(0xE0 or (value shr 12))
-      dest.add byte(0x80 or ((value shr 6) and 0x3F))
-      dest.add byte(0x80 or (value and 0x3F))
-    else:
-      dest.add byte(0xF0 or (value shr 18))
-      dest.add byte(0x80 or ((value shr 12) and 0x3F))
-      dest.add byte(0x80 or ((value shr 6) and 0x3F))
-      dest.add byte(0x80 or (value and 0x3F))
+    dest.addRuneBytes uint32(cell.rune)
   else:
     let first = int(cell.glyphOffset)
     let last = first + int(cell.glyphLen)
-    if first >= 0 and last <= b.glyphArena.len:
+    if last <= b.glyphArena.len:
       dest.add b.glyphArena.toOpenArray(first, last - 1)
 
 proc glyphString*(b: Buffer, cell: Cell): string =
@@ -208,7 +179,6 @@ proc setCell*(b: var Buffer, x, y: int, cell: Cell) =
   ## Framework renderers use `writeCluster` for atomic wide/complex writes.
   if x < 0 or y < 0 or x >= b.width or y >= b.height:
     return
-  b.markRow(y)
   b.repairAt(x, y)
   var value = cell
   value.glyphLen = 0
@@ -227,19 +197,13 @@ proc setCell*(b: var Buffer, x, y: int, cell: Cell) =
     else:
       b.cells[y * b.width + x] = defaultCell()
 
-proc writeCluster*(b: var Buffer, x, y: int, cluster: string,
-    style = styleDefault()): int =
-  ## Writes one already-sanitized grapheme atomically and returns its width.
-  result = cluster.clusterWidth(b.widthPolicy)
-  if result <= 0 or x < 0 or y < 0 or x >= b.width or y >= b.height or
-      x + result > b.width:
-    return
-  b.markRow(y)
+proc storeCluster(b: var Buffer, x, y: int, cluster: openArray[char],
+    width: int, style: Style) =
   b.repairAt(x, y)
-  if result == 2:
+  if width == 2:
     b.repairAt(x + 1, y)
   let base = cluster.runeAt(0)
-  var head = Cell(rune: base, style: style, displayWidth: uint8(result))
+  var head = Cell(rune: base, style: style, displayWidth: uint8(width))
   if cluster.len != base.size:
     var storedLen = min(cluster.len, int(high(uint16)))
     # A pathological grapheme can exceed the compact cell length field. Keep
@@ -251,58 +215,102 @@ proc writeCluster*(b: var Buffer, x, y: int, cluster: string,
         dec storedLen
     head.glyphOffset = uint32(b.glyphArena.len)
     head.glyphLen = uint16(storedLen)
-    for i in 0 ..< int(head.glyphLen):
-      b.glyphArena.add byte(cluster[i])
+    let first = b.glyphArena.len
+    b.glyphArena.setLen first + storedLen
+    for i in 0 ..< storedLen:
+      b.glyphArena[first + i] = byte(cluster[i])
   b.cells[y * b.width + x] = head
-  if result == 2:
+  if width == 2:
     b.cells[y * b.width + x + 1] = Cell(rune: tailRune, style: style,
       wideTail: true)
+
+proc writeCluster*(b: var Buffer, x, y: int, cluster: openArray[char],
+    width: int, style = styleDefault()): int =
+  ## Writes one already-sanitized, already-measured grapheme atomically and
+  ## returns its width. `width` must come from `clusterWidth` with this
+  ## buffer's width policy.
+  result = width
+  if result <= 0 or result > 2 or cluster.len == 0 or x < 0 or y < 0 or
+      x >= b.width or y >= b.height or x + result > b.width:
+    return 0
+  b.storeCluster(x, y, cluster, result, style)
+
+proc writeCluster*(b: var Buffer, x, y: int, cluster: string,
+    style = styleDefault()): int =
+  ## Writes one already-sanitized grapheme atomically and returns its width.
+  b.writeCluster(x, y, cluster.toOpenArray(0, cluster.len - 1),
+    cluster.clusterWidth(b.widthPolicy), style)
+
+proc writeSpans(b: var Buffer, x, y: int, safe: openArray[char],
+    style: Style) =
+  var cx = x
+  var cy = y
+  for span in safe.graphemeSpans:
+    let first = safe[span.a]
+    if span.len == 1 and first == '\n':
+      inc cy
+      cx = x
+      continue
+    if span.len == 1 and first == '\t':
+      let advance = 4 - ((max(0, cx - x)) mod 4)
+      if cy >= 0 and cy < b.height:
+        for unused in 0 ..< advance:
+          if cx >= 0 and cx < b.width:
+            b.storeCluster(cx, cy, " ", 1, style)
+          inc cx
+      else:
+        inc cx, advance
+      continue
+    let width = clusterWidth(safe.toOpenArray(span.a, span.b),
+      b.widthPolicy)
+    if width <= 0:
+      continue
+    if cy >= 0 and cy < b.height and cx >= 0 and cx + width <= b.width:
+      b.storeCluster(cx, cy, safe.toOpenArray(span.a, span.b), width, style)
+    inc cx, width
 
 proc writeStr*(b: var Buffer, x, y: int, value: string,
     style = styleDefault(), policy = plainTextPolicy()) =
   ## Sanitizes and writes text. Grapheme clusters are atomic, wide clusters
   ## occupy a head/tail pair, CRLF is normalized, tabs advance to a four-cell
   ## stop, and a wide cluster clipped at the right edge is omitted.
-  let safe = sanitizeText(value, policy)
-  var cx = x
-  var cy = y
-  for cluster in safe.graphemes:
-    if cluster == "\n":
-      inc cy
-      cx = x
-      continue
-    if cluster == "\t":
-      let advance = 4 - ((max(0, cx - x)) mod 4)
-      for unused in 0 ..< advance:
-        if cx >= 0 and cx < b.width and cy >= 0 and cy < b.height:
-          discard b.writeCluster(cx, cy, " ", style)
-        inc cx
-      continue
-    let width = cluster.clusterWidth(b.widthPolicy)
-    if width <= 0:
-      continue
-    if cy >= 0 and cy < b.height and cx >= 0 and cx + width <= b.width:
-      discard b.writeCluster(cx, cy, cluster, style)
-    inc cx, width
+  if value.isSanitized(policy):
+    b.writeSpans(x, y, value.toOpenArray(0, value.len - 1), style)
+  else:
+    let safe = sanitizeText(value, policy)
+    b.writeSpans(x, y, safe.toOpenArray(0, safe.len - 1), style)
 
 proc reset*(b: var Buffer, style = styleDefault()) =
   ## Clears every cell and reuses the complex-glyph arena capacity.
   b.glyphArena.setLen 0
   let blank = blankCell(style)
-  for y in 0 ..< b.height:
-    b.markRow(y)
-    for x in 0 ..< b.width:
-      b.cells[y * b.width + x] = blank
+  for cell in b.cells.mitems:
+    cell = blank
 
-proc copyCellFrom(dest: var Buffer, dx, dy: int, source: Buffer, sx, sy: int) =
-  let sourceCell = source.cellAt(sx, sy)
-  if sourceCell.wideTail:
+proc copyCellFrom(dest: var Buffer, dx, dy: int, source: Buffer,
+    cell: Cell) =
+  if cell.wideTail:
     return
-  if sourceCell.glyphLen == 0:
-    dest.setCell(dx, dy, sourceCell)
-  else:
-    discard dest.writeCluster(dx, dy, source.glyphString(sourceCell),
-      sourceCell.style)
+  let width = cell.cellWidth
+  if dx < 0 or dy < 0 or dx + width > dest.width or dy >= dest.height:
+    return
+  if cell.glyphLen == 0:
+    dest.setCell(dx, dy, cell)
+    return
+  let first = int(cell.glyphOffset)
+  let last = first + int(cell.glyphLen)
+  if last > source.glyphArena.len:
+    return
+  dest.repairAt(dx, dy)
+  if width == 2:
+    dest.repairAt(dx + 1, dy)
+  var head = cell
+  head.glyphOffset = uint32(dest.glyphArena.len)
+  dest.glyphArena.add source.glyphArena.toOpenArray(first, last - 1)
+  dest.cells[dy * dest.width + dx] = head
+  if width == 2:
+    dest.cells[dy * dest.width + dx + 1] = Cell(rune: tailRune,
+      style: cell.style, wideTail: true)
 
 proc resize*(b: var Buffer, w, h: int) =
   ## Resizes while preserving complete glyphs in the overlapping top-left
@@ -315,7 +323,7 @@ proc resize*(b: var Buffer, w, h: int) =
     while x < copyWidth:
       let cell = b.cells[y * b.width + x]
       if not cell.wideTail and x + cell.cellWidth <= copyWidth:
-        next.copyCellFrom(x, y, b, x, y)
+        next.copyCellFrom(x, y, b, cell)
       inc x, max(1, cell.cellWidth)
   b = next
 
@@ -324,12 +332,13 @@ proc clear*(b: var Buffer, rect: Rect, style = styleDefault()) =
   let clipped = intersection(rect, initRect(0, 0, b.width, b.height))
   if clipped.isEmpty:
     return
+  let blank = blankCell(style)
   for y in clipped.y ..< clipped.y + clipped.height:
-    b.markRow(y)
+    b.repairAt(clipped.x, y)
+    b.repairAt(clipped.x + clipped.width - 1, y)
+    let base = y * b.width
     for x in clipped.x ..< clipped.x + clipped.width:
-      b.repairAt(x, y)
-    for x in clipped.x ..< clipped.x + clipped.width:
-      b.cells[y * b.width + x] = blankCell(style)
+      b.cells[base + x] = blank
 
 proc restyle*(b: var Buffer, rect: Rect, style: Style) =
   ## Restyles every cell inside `rect` without changing its glyph; used for
@@ -338,7 +347,6 @@ proc restyle*(b: var Buffer, rect: Rect, style: Style) =
   if clipped.isEmpty:
     return
   for y in clipped.y ..< clipped.y + clipped.height:
-    b.markRow(y)
     for x in clipped.x ..< clipped.x + clipped.width:
       b.cells[y * b.width + x].style = style
 
@@ -348,13 +356,15 @@ proc fill*(b: var Buffer, rect: Rect, rune: Rune, style: Style) =
   if clipped.isEmpty:
     return
   b.clear(clipped, style)
+  if rune == Rune(0x0020):
+    return
   let width = max(1, rune.runeWidth(b.widthPolicy.ambiguous))
-  var encoded = $rune
+  let encoded = $rune
   for y in clipped.y ..< clipped.y + clipped.height:
     var x = clipped.x
     while x < clipped.x + clipped.width:
       if x + width <= clipped.x + clipped.width:
-        discard b.writeCluster(x, y, encoded, style)
+        b.storeCluster(x, y, encoded, width, style)
       inc x, width
 
 func checkInvariants*(b: Buffer): bool =
@@ -386,17 +396,14 @@ proc overlay*(destination: var Buffer, source: Buffer, x, y: int,
   ## may pass through; styled blanks remain opaque. Edge-clipped wide glyphs
   ## are omitted and both buffers retain valid head/tail pairs.
   for sourceY in 0 ..< source.height:
+    let destinationY = y + sourceY
+    if destinationY < 0 or destinationY >= destination.height:
+      continue
     var sourceX = 0
     while sourceX < source.width:
-      let cell = source.cellAt(sourceX, sourceY)
+      let cell = source.cells[sourceY * source.width + sourceX]
       let width = max(1, cell.cellWidth)
       if not cell.wideTail and not (transparentBlank and
           cell.isTransparentBlank):
-        let destinationX = x + sourceX
-        let destinationY = y + sourceY
-        if destinationX >= 0 and destinationY >= 0 and
-            destinationX + width <= destination.width and
-            destinationY < destination.height:
-          discard destination.writeCluster(destinationX, destinationY,
-            source.glyphString(cell), cell.style)
+        destination.copyCellFrom(x + sourceX, destinationY, source, cell)
       inc sourceX, width

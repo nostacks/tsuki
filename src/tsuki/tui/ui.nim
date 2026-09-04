@@ -1,5 +1,6 @@
 import std/[monotimes, times]
 import term
+import terminal
 import event
 import buffer
 import diff
@@ -31,42 +32,60 @@ type Ui* = object
   reactor*: Reactor
   lastW: int
   lastH: int
+  fullFlushPending: bool
+  inputClosedFlag: bool
 
 proc kittyEnable*(ui: var Ui) =
   ## Marks the terminal as kitty-capable and sends the disambiguate escape
   ## mode. Called by the startup probe and directly by tests.
   ui.term.setKittyProtocol(true)
-  ui.w.write cast[seq[byte]](kittyEnableSeq)
+  ui.w.write kittyEnableSeq.toOpenArrayByte(0, kittyEnableSeq.len - 1)
 
 proc kittyProbe*(ui: var Ui) =
   ## Queries kitty keyboard protocol support and enables it when the
-  ## terminal answers within 100 ms. Silent on unsupported terminals.
+  ## terminal answers. The primary device attributes reply that follows the
+  ## query ends the wait early on terminals without the protocol; the probe
+  ## gives up after 100 ms otherwise. Skipped without a real terminal.
   when defined(posix):
-    ui.w.write cast[seq[byte]](kittyQuery)
+    if not ui.term.interactive:
+      return
+    ui.w.write kittyQuery.toOpenArrayByte(0, kittyQuery.len - 1)
     let deadline = getMonoTime() + initDuration(
         milliseconds = kittyProbeTimeoutMs)
     var buf: array[64, byte]
-    while getMonoTime() < deadline:
+    while true:
+      let now = getMonoTime()
+      if now >= deadline:
+        break
+      let remaining = int((deadline - now).inMilliseconds) + 1
       var fds = [TPollfd(fd: cint(0), events: cshort(POLLIN), revents: 0)]
-      let r = posix.poll(addr fds[0], Tnfds(1), 10)
-      if r > 0 and (fds[0].revents and POLLIN) != 0:
-        let n = posix.read(cint(0), addr buf[0], buf.len)
-        if n <= 0:
-          break
-        ui.state.parse(buf.toOpenArray(0, int(n) - 1), ui.events)
-      if ui.state.kittySeen:
+      let r = posix.poll(addr fds[0], Tnfds(1), cint(remaining))
+      if r < 0:
+        if errno == EINTR:
+          continue
+        break
+      if r == 0:
+        break
+      let n = posix.read(cint(0), addr buf[0], buf.len)
+      if n <= 0:
+        break
+      ui.state.parse(buf.toOpenArray(0, int(n) - 1), ui.events)
+      if ui.state.kittySeen or ui.state.deviceAttributesSeen:
         break
   if ui.state.kittySupported():
     ui.kittyEnable()
 
 proc initUiWith*(o: sink Out, mouse = false, probe = false,
     maxPostedEvents = 4096, mode = tsmFullscreen): Ui =
-  ## Like `initUi` but with a caller-supplied output sink and optional
-  ## kitty probe. Used by tests with a fake tty.
+  ## Enters the terminal through the given sink, optionally probes kitty
+  ## support, allocates the double buffer, and returns the UI handle. Tests
+  ## pass a fake sink; `initUi` passes the process tty.
   result.w = o
   try:
     result.term.enter(result.w, mouse, mode)
     result.reactor = initReactor(maxPostedEvents)
+    when defined(posix):
+      result.term.setSignalWakeFd(result.reactor.signalFd)
     if probe:
       result.kittyProbe()
     let sz = result.term.size
@@ -76,6 +95,7 @@ proc initUiWith*(o: sink Out, mouse = false, probe = false,
     result.back = initBuffer(sz.w, sz.h)
   except CatchableError:
     try:
+      result.term.setSignalWakeFd(-1)
       result.term.leave()
     except CatchableError:
       discard
@@ -88,50 +108,44 @@ proc initUi*(mouse = false, probe = true, maxPostedEvents = 4096,
     mode = tsmFullscreen): Ui =
   ## Enters the terminal, probes kitty support, allocates the double buffer,
   ## and returns the UI handle. Call `poll` in a loop and `render` after
-  ## drawing into `back`.
-  result.w = initOut(cint(1))
-  try:
-    result.term.enter(result.w, mouse, mode)
-    result.reactor = initReactor(maxPostedEvents)
-    if probe:
-      result.kittyProbe()
-    let sz = result.term.size
-    result.lastW = sz.w
-    result.lastH = sz.h
-    result.front = initBuffer(sz.w, sz.h)
-    result.back = initBuffer(sz.w, sz.h)
-  except CatchableError:
-    try:
-      result.term.leave()
-    except CatchableError:
-      discard
-    if not result.reactor.isNil:
-      result.reactor.close()
-      result.reactor = nil
-    raise
+  ## drawing into `back`. Synchronized output is enabled only for terminals
+  ## that advertise it.
+  var output = initOut(cint(1))
+  output.syncOutput = detectCapabilities().synchronizedOutput
+  initUiWith(output, mouse, probe, maxPostedEvents, mode)
 
 proc leave*(ui: var Ui) =
   ## Restores the terminal.
   try:
+    ui.term.setSignalWakeFd(-1)
     ui.term.leave()
   finally:
     if not ui.reactor.isNil:
       ui.reactor.close()
       ui.reactor = nil
 
+func inputClosed*(ui: Ui): bool =
+  ## True once terminal input reached end-of-file or failed permanently.
+  ## Posted events and timers keep working; keyboard input never returns.
+  ui.inputClosedFlag
+
+proc flushFront(ui: var Ui) =
+  ui.w.flushFull(ui.front)
+  ui.fullFlushPending = false
+
 proc handleResize(ui: var Ui): Event =
-  ## Resizes both buffers preserving content and force-flushes a full frame.
+  ## Screen contents are undefined after a resize, so the next `render`
+  ## rewrites every row; `poll` rewrites the current frame if no render came.
   let sz = ui.term.size
   ui.front.resize(sz.w, sz.h)
   ui.back.resize(sz.w, sz.h)
-  ui.w.flushFull(ui.back)
-  swap(ui.front, ui.back)
   ui.lastW = sz.w
   ui.lastH = sz.h
+  ui.fullFlushPending = true
   Event(kind: evResize, width: sz.w, height: sz.h)
 
 proc drain(ui: var Ui): Event =
-  ## Parsed queued bytes and returns the next complete event, evNone when
+  ## Parses queued bytes and returns the next complete event, evNone when
   ## the queues are exhausted. Partial sequences resolve on their deadline.
   if ui.pending.len > 0:
     ui.state.parse(ui.pending, ui.events)
@@ -158,14 +172,28 @@ func nearestTimeout(a, b: int): int {.inline.} =
 func timeoutUntil(deadline, now: MonoTime): int {.inline.} =
   if deadline <= now:
     return 0
-  max(1, int(min((deadline - now).inMilliseconds,
-    int64(high(int32)))))
+  int(min(((deadline - now).inNanoseconds + 999_999) div 1_000_000,
+    int64(high(int32))))
+
+proc readTerminal(ui: var Ui): bool =
+  ## End-of-file and permanent errors close input so a dead terminal can
+  ## never spin the event loop.
+  var buf: array[4096, byte]
+  let n = ui.term.readInput(addr buf[0], buf.len)
+  if n > 0:
+    ui.pending.add buf.toOpenArray(0, n - 1)
+    return true
+  when defined(posix):
+    if n < 0 and (errno == EINTR or errno == EAGAIN):
+      return false
+  ui.inputClosedFlag = true
+  false
 
 proc poll*(ui: var Ui, timeoutMs: int): Event =
   ## Blocks up to `timeoutMs` (negative waits indefinitely) and returns one
-  ## event. Resize coalesces into a single evResize with a full rewrite. Wake
-  ## notifications are handled iteratively so repeated timer/configuration
-  ## changes cannot grow the call stack or restart the caller's timeout.
+  ## event. Resize coalesces into a single evResize. Wake notifications are
+  ## handled iteratively so repeated timer/configuration changes cannot grow
+  ## the call stack or restart the caller's timeout.
   if ui.reactor.isNil:
     return Event(kind: evNone)
   let hasCallerDeadline = timeoutMs >= 0
@@ -173,6 +201,8 @@ proc poll*(ui: var Ui, timeoutMs: int): Event =
     getMonoTime() + initDuration(milliseconds = max(0, timeoutMs))
   else:
     MonoTime()
+  if ui.fullFlushPending:
+    ui.flushFront()
   while true:
     if ui.term.takeResize():
       return ui.handleResize()
@@ -193,26 +223,28 @@ proc poll*(ui: var Ui, timeoutMs: int): Event =
       ui.state.deadlineMs(now))
     effectiveTimeout = nearestTimeout(effectiveTimeout,
       ui.reactor.nextTimerMs(now))
+    let wantInput = ui.term.interactive and not ui.inputClosedFlag
     let ready = when defined(posix):
       ui.reactor.waitReady(
-        if ui.term.interactive: cint(0) else: cint(-1), effectiveTimeout)
+        if wantInput: cint(0) else: cint(-1), effectiveTimeout)
     else:
       ui.reactor.waitReady(
-        if ui.term.interactive: ui.term.inputHandle else: Handle(-1),
+        if wantInput: ui.term.inputHandle else: Handle(-1),
         effectiveTimeout)
     case ready
     of rkInput:
-      var buf: array[4096, byte]
-      let n = ui.term.readInput(addr buf[0], buf.len)
-      if n <= 0:
-        return Event(kind: evNone)
-      ui.pending.add buf.toOpenArray(0, n - 1)
+      if not ui.readTerminal():
+        if ui.inputClosedFlag:
+          return Event(kind: evNone)
+        continue
       result = ui.drain()
       if result.kind != evNone:
         return
       if timeoutMs == 0:
         return Event(kind: evNone)
     of rkWake:
+      if ui.term.takeResize():
+        return ui.handleResize()
       if ui.reactor.popPosted(result):
         return
       if ui.reactor.popExpired(result):
@@ -222,9 +254,10 @@ proc poll*(ui: var Ui, timeoutMs: int): Event =
         return Event(kind: evNone)
     of rkTimeout:
       result = ui.drain()
-      if result.kind == evNone:
-        discard ui.reactor.popExpired(result)
-      return
+      if result.kind != evNone or ui.reactor.popExpired(result):
+        return
+      if hasCallerDeadline and getMonoTime() >= callerDeadline:
+        return Event(kind: evNone)
     of rkInterrupted:
       if ui.term.takeResize():
         return ui.handleResize()
@@ -235,8 +268,12 @@ proc poll*(ui: var Ui, timeoutMs: int): Event =
 
 proc render*(ui: var Ui) =
   ## Diffs `back` against `front`, writes the changed runs in one syscall,
-  ## and swaps the buffers.
-  diffInto(ui.front, ui.back, ui.w)
+  ## and swaps the buffers. After a resize the whole frame is rewritten.
+  if ui.fullFlushPending:
+    ui.w.flushFull(ui.back)
+    ui.fullFlushPending = false
+  else:
+    diffInto(ui.front, ui.back, ui.w)
   swap(ui.front, ui.back)
 
 proc wait*(ui: var Ui): Event =

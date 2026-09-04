@@ -70,6 +70,8 @@ type
     stats*: RunStats
     lastFrame: MonoTime
     deferredRedraw: TimerId
+    deferredDeadline: MonoTime
+    laterDeadline: MonoTime
 
 func tuiOptions*(mode = tmFullscreen, mouse = false,
     probeCapabilities = true, maxFramesPerSecond = 60,
@@ -175,15 +177,34 @@ proc suspend*(app: var TuiApp): TuiResult[bool] =
     app.dirty = true
     app.lastFrame = MonoTime()
     app.deferredRedraw = TimerId(0)
+    app.deferredDeadline = MonoTime()
+    app.laterDeadline = MonoTime()
     TuiResult[bool](ok: true, value: true)
+
+proc scheduleRedraw(app: var TuiApp, deadline: MonoTime)
+
+proc absorbDeferred(app: var TuiApp, event: var Event) =
+  ## The framework's own redraw timer becomes `dirty`; hosts never see it.
+  if event.kind != evTimer or uint64(app.deferredRedraw) == 0 or
+      event.timerId != uint64(app.deferredRedraw):
+    return
+  app.deferredRedraw = TimerId(0)
+  app.dirty = true
+  event = Event(kind: evNone)
+  if app.laterDeadline != MonoTime():
+    let later = app.laterDeadline
+    app.laterDeadline = MonoTime()
+    app.scheduleRedraw(later)
 
 proc wait*(app: var TuiApp): Event =
   ## Blocks for one real event/deadline. No deadline means one indefinite OS
-  ## wait with no periodic framework work.
+  ## wait with no periodic framework work. A pending redraw deadline returns
+  ## evNone with `dirty` set.
   if not app.running:
     return Event(kind: evNone)
   inc app.stats.waits
   result = app.ui.wait()
+  app.absorbDeferred(result)
   if result.kind != evNone:
     inc app.stats.wakeups
 
@@ -193,6 +214,7 @@ proc poll*(app: var TuiApp, timeoutMs: int): Event =
     return Event(kind: evNone)
   inc app.stats.waits
   result = app.ui.poll(timeoutMs)
+  app.absorbDeferred(result)
   if result.kind != evNone:
     inc app.stats.wakeups
 
@@ -226,28 +248,41 @@ proc cancelTimer*(app: TuiApp, id: TimerId): bool =
   ## Cancels an application timer.
   app.ui.cancelTimer(id)
 
+proc scheduleRedraw(app: var TuiApp, deadline: MonoTime) =
+  ## Earliest deadline wins; a later one is re-armed after it fires.
+  if uint64(app.deferredRedraw) != 0:
+    if app.deferredDeadline <= deadline:
+      if app.laterDeadline == MonoTime() or deadline < app.laterDeadline:
+        app.laterDeadline = deadline
+      return
+    if app.laterDeadline == MonoTime() or app.deferredDeadline <
+        app.laterDeadline:
+      app.laterDeadline = app.deferredDeadline
+    discard app.cancelTimer(app.deferredRedraw)
+  app.deferredRedraw = app.ui.reactor.setTimerAt(deadline)
+  app.deferredDeadline = deadline
+
 proc requestRedraw(app: var TuiApp) =
   let frameTime = initDuration(nanoseconds =
     1_000_000_000 div max(1, app.options.maxFramesPerSecond))
   let now = getMonoTime()
   let earliest = app.lastFrame + frameTime
   if app.stats.drawCalls > 0 and now < earliest:
-    if uint64(app.deferredRedraw) != 0:
-      discard app.cancelTimer(app.deferredRedraw)
-    app.deferredRedraw = app.ui.reactor.setTimerAt(earliest)
+    app.scheduleRedraw(earliest)
   else:
     app.dirty = true
 
-proc applyUpdate(app: var TuiApp, update: Update) =
+proc apply*(app: var TuiApp, update: Update) =
+  ## Applies a handler's requested effect: invalidation with frame pacing,
+  ## an exact redraw deadline, quit, or suspend. Host-driven loops that call
+  ## `wait` and `draw` themselves use this to get the same pacing as `runTui`.
   case update.kind
   of ukUnchanged:
     discard
   of ukRedraw:
     app.requestRedraw()
   of ukRedrawAt:
-    if uint64(app.deferredRedraw) != 0:
-      discard app.cancelTimer(app.deferredRedraw)
-    app.deferredRedraw = app.ui.reactor.setTimerAt(update.deadline)
+    app.scheduleRedraw(update.deadline)
   of ukQuit:
     app.running = false
   of ukSuspend:
@@ -255,10 +290,20 @@ proc applyUpdate(app: var TuiApp, update: Update) =
     if not suspended.ok:
       raise newException(IOError, suspended.error)
 
+proc handleEvent(app: var TuiApp, event: Event, update: UpdateProc) =
+  if event.kind == evNone:
+    return
+  inc app.stats.updateCalls
+  app.apply(update(event))
+  if event.kind == evResize:
+    app.dirty = true
+
 proc runTui*(update: UpdateProc, drawCallback: DrawProc,
     options = tuiOptions()): TuiResult[RunStats] =
   ## Runs an event-driven application with automatic scoped cleanup. Posted
   ## bursts are drained in bounded batches and collapse into one invalidation.
+  ## A resize always redraws. The loop ends when the handler quits or when an
+  ## interactive terminal's input reaches end-of-file.
   var opened = openTui(options)
   if not opened.ok:
     return TuiResult[RunStats](ok: false, error: opened.error)
@@ -267,28 +312,15 @@ proc runTui*(update: UpdateProc, drawCallback: DrawProc,
     app.draw(drawCallback)
     while app.running:
       var event = app.wait()
-      if event.kind == evNone:
-        continue
-      if event.kind == evTimer and uint64(app.deferredRedraw) != 0 and
-          event.timerId == uint64(app.deferredRedraw):
-        app.deferredRedraw = TimerId(0)
-        app.dirty = true
-      else:
-        inc app.stats.updateCalls
-        app.applyUpdate(update(event))
-      # Coalesce a bounded posted burst before deciding whether to render.
+      if event.kind == evNone and app.ui.inputClosed:
+        break
+      app.handleEvent(event, update)
       var drained = 0
       while app.running and drained < 255:
         let extra = app.poll(0)
         if extra.kind == evNone:
           break
-        if extra.kind == evTimer and uint64(app.deferredRedraw) != 0 and
-            extra.timerId == uint64(app.deferredRedraw):
-          app.deferredRedraw = TimerId(0)
-          app.dirty = true
-        else:
-          inc app.stats.updateCalls
-          app.applyUpdate(update(extra))
+        app.handleEvent(extra, update)
         inc drained
       if app.running and app.dirty:
         app.draw(drawCallback)

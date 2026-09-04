@@ -206,8 +206,8 @@ proc nextTimerMs*(reactor: Reactor, now = getMonoTime()): int =
     return -1
   if reactor.timers[0].deadline <= now:
     return 0
-  let remaining = (reactor.timers[0].deadline - now).inMilliseconds
-  max(1, int(min(remaining, int64(high(int32)))))
+  let remaining = (reactor.timers[0].deadline - now).inNanoseconds
+  int(min((remaining + 999_999) div 1_000_000, int64(high(int32))))
 
 proc popExpired*(reactor: Reactor, fired: var Event,
     now = getMonoTime()): bool =
@@ -228,6 +228,11 @@ when defined(posix):
   func wakeFd*(reactor: Reactor): cint =
     ## Returns the POSIX wake descriptor for host-loop integration.
     reactor.readFd
+
+  func signalFd*(reactor: Reactor): cint =
+    ## Returns the non-blocking write end of the wake pipe. A one-byte write
+    ## to it is async-signal-safe and wakes a blocked `waitReady`.
+    if reactor.isNil: cint(-1) else: reactor.writeFd
 
 when defined(posix):
   type InputWaitHandle* = cint
@@ -269,9 +274,10 @@ proc waitReady*(reactor: Reactor,
     if ready < 0:
       if errno == EINTR: return rkInterrupted
       raiseOSError(osLastError())
-    if (fds[0].revents and POLLIN) != 0:
+    let readable = cshort(POLLIN or POLLHUP or POLLERR or POLLNVAL)
+    if (fds[0].revents and readable) != 0:
       return rkWake
-    if count == 2 and (fds[1].revents and POLLIN) != 0:
+    if count == 2 and (fds[1].revents and readable) != 0:
       return rkInput
     rkInterrupted
   else:
@@ -289,11 +295,12 @@ proc waitReady*(reactor: Reactor,
     else: rkInterrupted
 
 proc acknowledgeWake*(reactor: Reactor) =
-  ## Clears a timer/configuration wake after the owner has recomputed state.
+  ## Drains a wake that carried no event. Signal handlers write to
+  ## `signalFd` without setting `wakePending`, so the flag is not trusted.
   if reactor.isNil:
     return
   acquire(reactor.lock)
-  if reactor.queueHead >= reactor.queue.len and reactor.wakePending:
+  if reactor.queueHead >= reactor.queue.len:
     reactor.consumeWake()
   release(reactor.lock)
 

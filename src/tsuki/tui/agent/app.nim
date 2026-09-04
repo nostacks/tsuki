@@ -265,8 +265,10 @@ func lerpColor(a, b: Color, t: float): Color =
   func channel(x, y: range[0..255]): range[0..255] =
     byte(min(255.0, max(0.0,
       float(x) + (float(y) - float(x)) * t)))
-  Color(kind: ckRgb, rgb: [channel(a.rgb[0], b.rgb[0]),
-    channel(a.rgb[1], b.rgb[1]), channel(a.rgb[2], b.rgb[2])])
+  let first = a.rgb
+  let second = b.rgb
+  rgb(channel(first[0], second[0]), channel(first[1], second[1]),
+    channel(first[2], second[2]))
 
 proc writeShimmer(frame: Frame, x, y: int, text: string, phase: float,
     colors: AgentTheme) =
@@ -283,7 +285,7 @@ proc writeShimmer(frame: Frame, x, y: int, text: string, phase: float,
     let distance = abs(float(index) - phase)
     let t = if distance < 3.5: 0.5 * (1.0 + cos(PI * distance / 3.5)) else: 0.0
     frame.write(cx, y, cluster,
-      Style(fg: lerpColor(base, peak, t), bg: Color(kind: ckDefault)))
+      Style(fg: lerpColor(base, peak, t)))
     inc cx, width
     inc index
 

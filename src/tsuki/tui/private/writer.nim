@@ -11,6 +11,10 @@ when defined(windows):
 else:
   import std/posix as posixapi
 
+const
+  seqSyncBegin = "\x1b[?2026h"
+  seqSyncEnd = "\x1b[?2026l"
+
 type
   OutKind* = enum
     outTty
@@ -23,6 +27,7 @@ type
     curStyle*: Style
     curValid*: bool
     truecolor*: bool
+    syncOutput*: bool
     case kind*: OutKind
     of outTty:
       fd*: cint
@@ -62,7 +67,7 @@ proc write*(o: var Out, data: openArray[byte]) =
       else:
         let n = posixapi.write(o.fd, unsafeAddr data[off], int(data.len - off))
         if n < 0:
-          if errno == EINTR:
+          if errno == EINTR or errno == EAGAIN:
             continue
           raiseOSError(osLastError())
         if n == 0:
@@ -116,15 +121,43 @@ proc addRune*(f: var seq[byte], r: Rune) {.inline.} =
     f.add byte(0x80 or ((v shr 6) and 0x3F))
     f.add byte(0x80 or (v and 0x3F))
 
-func isBlank(c: Cell): bool {.inline.} =
+func isBlank*(c: Cell): bool {.inline.} =
   c.rune == Rune(0x0020) and c.glyphLen == 0 and not c.wideTail and
     c.style == styleDefault()
+
+func rowContentEnd*(b: Buffer, y: int): int =
+  let base = y * b.width
+  result = b.width
+  while result > 0 and b.cells[base + result - 1].isBlank:
+    dec result
+
+proc beginFrame*(o: var Out) {.inline.} =
+  o.frame.setLen 0
+  if o.syncOutput:
+    o.frame.addSeq seqSyncBegin
+
+proc endFrame*(o: var Out) =
+  if o.syncOutput:
+    if o.frame.len == seqSyncBegin.len:
+      o.frame.setLen 0
+      return
+    o.frame.addSeq seqSyncEnd
+  o.write o.frame
+
+proc setStyle*(o: var Out, cur: var Style, haveCur: var bool,
+    next: Style) {.inline.} =
+  if not haveCur:
+    o.frame.addStyleReset(next, o.truecolor)
+    haveCur = true
+  else:
+    o.frame.addStyleTransition(cur, next, o.truecolor)
+  cur = next
 
 proc flushFull*(o: var Out, b: Buffer) =
   ## Serializes the entire buffer into one frame: cursor home, one row per
   ## line, trailing blank runs collapsed into an erase-to-end-of-line. The
   ## frame is emitted as a single write syscall.
-  o.frame.setLen 0
+  o.beginFrame()
   let def = styleDefault()
   o.frame.addSeq "\x1b[H"
   var cur = o.curStyle
@@ -132,24 +165,19 @@ proc flushFull*(o: var Out, b: Buffer) =
   for y in 0 ..< b.height:
     if y > 0:
       o.frame.addCursorMove(y + 1, 1)
-    var trailing = 0
-    while trailing < b.width and
-        b.cells[y * b.width + (b.width - 1 - trailing)].isBlank:
-      inc trailing
-    for x in 0 ..< b.width - trailing:
-      let c = b.cells[y * b.width + x]
+    let contentEnd = b.rowContentEnd(y)
+    let base = y * b.width
+    for x in 0 ..< contentEnd:
+      let c = b.cells[base + x]
       if c.wideTail:
         continue
       if not haveCur or c.style != cur:
-        o.frame.addSeq styleDiffToSeq(c.style, o.truecolor)
-        cur = c.style
-        haveCur = true
+        o.setStyle(cur, haveCur, c.style)
       o.frame.appendGlyphBytes(b, c)
-    if trailing > 0:
-      if haveCur and cur != def:
-        o.frame.addSeq "\x1b[0m"
-        cur = def
+    if contentEnd < b.width:
+      if not haveCur or cur != def:
+        o.setStyle(cur, haveCur, def)
       o.frame.addSeq "\x1b[K"
   o.curStyle = cur
   o.curValid = true
-  o.write o.frame
+  o.endFrame()

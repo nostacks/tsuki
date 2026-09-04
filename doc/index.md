@@ -31,6 +31,11 @@ discard runTui(
 `wait()` uses one blocking OS wait when there is no timer, partial input
 deadline, or externally posted event. `redraw`, `redrawAt`, and explicit timers
 are the only scheduling sources; rendering is capped by `maxFramesPerSecond`.
+When several `redrawAt` deadlines are pending the earliest fires first and the
+later ones are re-armed afterwards. A resize always redraws, and the run loop
+ends cleanly when an interactive terminal's input reaches end-of-file. Hosts
+that drive `TuiApp` themselves call `wait`, `apply`, and `draw` to get the same
+pacing.
 Fullscreen, inline, and deterministic headless modes are selected with
 `tuiOptions(mode = ...)`. A handler can return `suspendTui()` for Ctrl-Z;
 POSIX restores the terminal before stopping and re-enters it after resume.
@@ -61,10 +66,11 @@ payloads cannot pass through the plain writer. Use `parseAnsiText` only for
 opt-in subprocess formatting; it allowlists SGR styling and turns OSC/other
 commands into inert visible labels.
 
-Optional hyperlinks, clipboard writes, synchronized output, and image metadata
-live under `tsuki/tui/protocols`. They require advertised capabilities, safe
-metadata, size limits, and—where an external effect is involved—an explicit
-application decision.
+Optional hyperlinks, clipboard writes, and image metadata live under
+`tsuki/tui/protocols`. They require advertised capabilities, safe metadata,
+size limits, and, where an external effect is involved, an explicit
+application decision. The runtime wraps each frame in DEC synchronized output
+on terminals that advertise it and writes nothing for an unchanged frame.
 
 ## Agent applications
 
