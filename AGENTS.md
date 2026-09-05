@@ -7,9 +7,12 @@ files should reference it instead of duplicating it.
 ## Project scope
 
 Tsuki is a fast, tiny, modular coding agent written in Nim 2.2+. Its executable
-entry point is `src/tsuki.nim`, its in-repo terminal framework, he3, has its
-facade at `src/tsuki/tui.nim`, and its transport-neutral agent UI facade is
-`src/tsuki/tui/agent.nim`.
+entry point is `src/tsuki.nim`. Its terminal framework, he3, is a separate
+Nimble package under `packages/he3/` with its facade at
+`packages/he3/src/he3.nim` and its transport-neutral agent UI facade at
+`packages/he3/src/he3/agent.nim`. The root package reaches he3 through
+`--path:packages/he3/src`; consumers install it with
+`nimble install "https://github.com/nostacks/tsuki?subdir=packages/he3"`.
 
 he3 owns terminal lifecycle, events, rendering, widgets, and agent UI
 state. It does not own model transports, credentials, tool execution, or host
@@ -18,15 +21,19 @@ authorization policy. Keep those boundaries explicit within the coding agent.
 ## Repository map
 
 - `src/tsuki.nim` — coding-agent executable entry point.
-- `src/tsuki/` — modular agent and he3 implementation.
-- `src/tsuki/tui/private/` — internal terminal and writer details; do not
-  expose these through ordinary public APIs.
-- `src/tsuki/tui/protocols/` — optional, capability-gated terminal protocols.
-- `src/tsuki/tui/agent/` — transport-neutral agent model and views.
+- `src/tsuki/` — modular agent implementation: providers, sessions, tools,
+  configuration, and the `tui_bridge` adapter to he3.
+- `tests/` — product and agent tests.
+- `packages/he3/` — the he3 package: `he3.nimble`, `src`, `tests`, `bench`.
+- `packages/he3/src/he3/private/` — internal terminal and writer details; do
+  not expose these through ordinary public APIs.
+- `packages/he3/src/he3/protocols/` — optional, capability-gated terminal
+  protocols.
+- `packages/he3/src/he3/agent/` — transport-neutral agent model and views.
+- `packages/he3/tests/` — unit, property, headless, and PTY coverage.
+- `packages/he3/bench/` — performance checks and their baseline.
 - `examples/` — exactly `hello_world.nim`, `counter.nim`, and
   `agent_chat.nim`, plus `nim.cfg`.
-- `tests/tui/` — unit, property, headless, and PTY coverage.
-- `bench/tui/` — performance checks and their baseline.
 - `doc/` — public guide, migration notes, and manual compatibility evidence.
 
 ## Working rules
@@ -71,7 +78,10 @@ authorization policy. Keep those boundaries explicit within the coding agent.
 
 ## Validation
 
-Run the smallest relevant check while iterating, then run the release gate:
+Run the smallest relevant check while iterating, then run the release gate
+from the repository root. The root tasks run the product checks and then
+delegate to the same-named task in `packages/he3`, which can also be run there
+directly:
 
 ```sh
 nimble test

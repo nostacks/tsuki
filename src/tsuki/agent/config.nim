@@ -13,6 +13,7 @@ type
     archivedDir*: string
     cacheDir*: string
     modelCacheFile*: string
+    credentialsFile*: string
 
   ProviderConfig* = object
     id*: ProviderId
@@ -83,6 +84,7 @@ proc platformPaths*(home = "", configHome = "", dataHome = "",
   result.sessionsDir = result.dataDir / "sessions"
   result.archivedDir = result.dataDir / "archived"
   result.modelCacheFile = result.cacheDir / "models.json"
+  result.credentialsFile = result.dataDir / "credentials.json"
 
 func defaultConfig*(): TsukiConfig =
   let bounds = phase1Limits()
@@ -231,7 +233,8 @@ proc parseConfig*(source: string): ConfigLoadResult =
             let modelUnknown = modelNode.unknownKeys(["id", "displayName",
               "textInput", "imageInput", "streaming", "tools",
               "contextWindow", "maxOutputTokens", "available",
-              "unavailableReason"])
+              "unavailableReason", "reasoningEfforts",
+              "defaultReasoningEffort"])
             if modelUnknown.len > 0:
               result.error = "unknown model fields: " & modelUnknown
               return
@@ -262,6 +265,24 @@ proc parseConfig*(source: string): ConfigLoadResult =
               available: modelNode{"available"}.getBool(true),
               unavailableReason: modelNode{"unavailableReason"}.getStr
               .safeDisplay(1024), provenance: provenanceConfigured)
+            let efforts = modelNode{"reasoningEfforts"}
+            if not efforts.isNil:
+              if efforts.kind != JArray or efforts.len > 16:
+                result.error = "reasoningEfforts must be an array of at most 16 levels"
+                return
+              for effort in efforts:
+                let value = effort.getStr
+                if effort.kind != JString or value.len == 0 or
+                    value.len > 64 or value.safeId(64) != value:
+                  result.error = "reasoningEfforts must contain valid level identifiers"
+                  return
+                providerConfig.models[^1].addReasoningEffort(value)
+            let defaultEffort = modelNode{"defaultReasoningEffort"}.getStr
+            if defaultEffort.len > 0 and
+                defaultEffort notin providerConfig.models[^1].reasoningEfforts:
+              result.error = "defaultReasoningEffort must be a supported level"
+              return
+            providerConfig.models[^1].defaultReasoningEffort = defaultEffort
           else:
             result.error = "models must be strings or objects"
             return

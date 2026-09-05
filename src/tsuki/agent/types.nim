@@ -34,6 +34,8 @@ type
     capabilities*: ModelCapabilities
     contextWindow*: int64
     maxOutputTokens*: int64
+    reasoningEfforts*: seq[string] ## Provider-advertised or configured choices.
+    defaultReasoningEffort*: string
     available*: bool
     unavailableReason*: string
     provenance*: ModelProvenance
@@ -152,6 +154,7 @@ type
     updatedAtMs*: int64
     providerId*: ProviderId
     modelId*: ModelId
+    reasoningEffort*: string ## Empty delegates to the provider default.
     stagedAttachments*: seq[ImageReference]
     messages*: seq[Message]
     lastTurnState*: TurnState
@@ -187,24 +190,62 @@ func supportedCapabilities*(text = true, image = false, streaming = true,
 func unknownCapabilities*(): ModelCapabilities =
   ModelCapabilities()
 
-proc safeDisplay*(value: string, maxBytes = 1024): string =
-  ## Removes controls and bidi overrides while preserving ordinary Unicode.
-  if maxBytes <= 0: return ""
+const replacementRune = "\xEF\xBF\xBD"
+
+func trimToBoundary(value: var string, maxBytes: int) =
+  while value.len > maxBytes:
+    value.setLen(value.len - 1)
+  while value.len > 0 and validateUtf8(value) >= 0:
+    value.setLen(value.len - 1)
+
+proc safeDisplaySlow(value: string, maxBytes: int): string =
   for rune in value.runes:
     let number = int(rune)
     if number == 0x0A or number == 0x09:
       result.add rune.toUTF8
     elif number < 0x20 or number in 0x7F .. 0x9F or
         number in 0x202A .. 0x202E or number in 0x2066 .. 0x2069:
-      result.add "�"
+      result.add replacementRune
     else:
       result.add rune.toUTF8
     if result.len >= maxBytes:
-      while result.len > maxBytes:
-        result.setLen(result.len - 1)
-      while result.len > 0 and validateUtf8(result) >= 0:
-        result.setLen(result.len - 1)
+      result.trimToBoundary(maxBytes)
       break
+
+proc safeDisplay*(value: string, maxBytes = 1024): string =
+  ## Removes controls and bidi overrides while preserving ordinary Unicode.
+  if maxBytes <= 0: return ""
+  if validateUtf8(value) >= 0:
+    return safeDisplaySlow(value, maxBytes)
+  result = newStringOfCap(min(value.len, maxBytes))
+  var index = 0
+  while index < value.len:
+    let first = value[index]
+    if first < '\x80':
+      if first == '\n' or first == '\t' or (first >= ' ' and first != '\x7F'):
+        result.add first
+      else:
+        result.add replacementRune
+      inc index
+    else:
+      let width = runeLenAt(value, index)
+      var forbidden = false
+      if width == 2 and first == '\xC2':
+        forbidden = value[index + 1] in '\x80' .. '\x9F'
+      elif width == 3 and first == '\xE2':
+        let second = value[index + 1]
+        let third = value[index + 2]
+        forbidden = (second == '\x80' and third in '\xAA' .. '\xAE') or
+          (second == '\x81' and third in '\xA6' .. '\xA9')
+      if forbidden:
+        result.add replacementRune
+      else:
+        for offset in 0 ..< width:
+          result.add value[index + offset]
+      inc index, width
+    if result.len >= maxBytes:
+      result.trimToBoundary(maxBytes)
+      return
 
 func safeId*(value: string, maxBytes = 128): string =
   ## Converts an external identifier to a bounded filename/log-safe value.
@@ -218,6 +259,12 @@ func safeId*(value: string, maxBytes = 128): string =
 
 func textPart*(text: string): ContentPart =
   ContentPart(kind: contentText, text: text)
+
+proc addReasoningEffort*(model: var ModelDescriptor, value: string) =
+  ## Retains at most sixteen distinct, bounded provider effort identifiers.
+  if value.len > 0 and value.len <= 64 and value.safeId(64) == value and
+      value notin model.reasoningEfforts and model.reasoningEfforts.len < 16:
+    model.reasoningEfforts.add value
 
 func summaryPart*(text: string): ContentPart =
   ContentPart(kind: contentVisibleSummary, text: text)

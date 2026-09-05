@@ -133,9 +133,30 @@ proc validateUnchanged*(workspaceRoot: string,
     result.attachment.state = attachmentChanged
     result.error = "attachment changed after it was staged"
 
+proc metadataUnchanged(workspaceRoot: string, image: ImageReference): bool =
+  ## A regular file with the recorded size and mtime skips the header read;
+  ## providers revalidate both again immediately before sending.
+  if image.width <= 0 or image.height <= 0 or image.sizeBytes <= 0:
+    return false
+  let path = if image.location == attachmentWorkspaceRelative:
+    workspaceRoot / image.path else: image.path
+  try:
+    let info = getFileInfo(path, followSymlink = false)
+    info.kind == pcFile and not info.isSpecial and
+      info.size == image.sizeBytes and
+      info.lastWriteTime.toUnix * 1000 == image.modifiedAtMs
+  except CatchableError:
+    false
+
 proc refreshImageReference(workspaceRoot: string, image: var ImageReference,
     limits: AgentLimits): bool =
   let previous = image
+  if metadataUnchanged(workspaceRoot, image):
+    if previous.state == attachmentSending:
+      image.state = attachmentFailed
+    elif previous.state notin {attachmentSent, attachmentReady}:
+      image.state = attachmentReady
+    return image.state != previous.state
   let checked = validateUnchanged(workspaceRoot, image, limits)
   if checked.error.len == 0:
     image = checked.attachment

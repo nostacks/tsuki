@@ -11,7 +11,7 @@ binDir        = "build"
 bin           = @["tsuki"]
 installExt    = @["nim"]
 installFiles  = @["CHANGELOG.md", "LICENSE", "README.md"]
-skipDirs      = @["bench", "build", "doc", "examples", "nimcache", "tests",
+skipDirs      = @["build", "doc", "examples", "nimcache", "packages", "tests",
                   "tools"]
 
 
@@ -21,64 +21,62 @@ requires "nim >= 2.2.0"
 
 switch("define", "ssl")
 
+const he3Path = "--path:packages/he3/src"
+
 proc prepareBuildDir(directory: string) =
   mkDir("build/" & directory)
+
+proc he3Task(name: string) =
+  withDir "packages/he3":
+    exec "nimble " & name
 
 
 task test, "run the debug and release test suites":
   prepareBuildDir("tests")
-  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-basic --out:build/tests/basic tests/test1.nim"
-  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-agent --out:build/tests/agent tests/agent/all.nim"
-  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-codex-local --out:build/tests/codex-local tests/agent/codex_local.nim"
-  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-debug --out:build/tests/tui-debug tests/tui/all.nim"
-  exec "nim c -r --threads:on -d:release --path:src --nimcache:build/nimcache/test-release --out:build/tests/tui-release tests/tui/all.nim"
+  exec "nim c -r --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/test-basic --out:build/tests/basic tests/test1.nim"
+  exec "nim c -r --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/test-agent --out:build/tests/agent tests/agent/all.nim"
+  exec "nim c -r --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/test-codex-local --out:build/tests/codex-local tests/agent/codex_local.nim"
+  he3Task("test")
 
 task testFresh, "audit clean-checkout inputs and run the full suite":
-  for fixture in ["tests/tui/nim.cfg", "tests/tui/corpora/legacy.txt",
-      "tests/tui/corpora/kitty.txt",
-      "tests/tui/corpora/unicode_grapheme_16.txt"]:
+  for fixture in ["packages/he3/tests/nim.cfg",
+      "packages/he3/tests/corpora/legacy.txt",
+      "packages/he3/tests/corpora/kitty.txt",
+      "packages/he3/tests/corpora/unicode_grapheme_16.txt"]:
     if not fileExists(fixture):
       raise newException(IOError, "missing test fixture: " & fixture)
   exec "nimble test"
 
 task testProviderLocal, "run the opt-in loopback provider transport fixture":
   prepareBuildDir("tests")
-  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-provider-local --out:build/tests/provider-local tests/agent/openai_local.nim"
+  exec "nim c -r --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/test-provider-local --out:build/tests/provider-local tests/agent/openai_local.nim"
 
 task testCodexLocal, "run the local Codex App Server protocol fixture":
   prepareBuildDir("tests")
-  exec "nim c -r --threads:on --path:src --nimcache:build/nimcache/test-codex-local --out:build/tests/codex-local tests/agent/codex_local.nim"
+  exec "nim c -r --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/test-codex-local --out:build/tests/codex-local tests/agent/codex_local.nim"
 
 task testWindows, "run the platform test suite on a native Windows host":
-  when defined(windows):
-    prepareBuildDir("tests")
-    exec "nim c -r --threads:on -d:release --path:src --nimcache:build/nimcache/test-windows --out:build/tests/tui-windows tests/tui/all.nim"
-  else:
-    echo "testWindows requires a native Windows host"
+  he3Task("testWindows")
 
 task lint, "format and check all public Nim modules":
-  for directory in ["src", "tests", "examples", "bench"]:
+  for directory in ["src", "tests", "examples"]:
     for source in walkDirRec(directory):
       if source.endsWith(".nim"):
         exec "nimpretty --indent:2 " & source
-  exec "git diff --exit-code -- src tests examples bench"
-  exec "nim check --threads:on --path:src src/tsuki.nim"
-  exec "nim check --threads:on --path:src src/tsuki/tui.nim"
-  exec "nim check --threads:on --path:src src/tsuki/tui/agent.nim"
-  exec "nim check --threads:on --path:src src/tsuki/tui/expert.nim"
+  exec "git diff --exit-code -- src tests examples"
+  exec "nim check --threads:on --path:src " & he3Path & " src/tsuki.nim"
+  he3Task("lint")
 
-task docs, "build he3 API documentation":
-  exec "nim doc --threads:on --path:src --outdir:doc/htmldocs/product src/tsuki/agent.nim"
-  exec "nim doc --path:src --outdir:doc/htmldocs src/tsuki/tui.nim"
-  exec "nim doc --threads:on --path:src --outdir:doc/htmldocs src/tsuki/tui/agent.nim"
+task docs, "build tsuki and he3 API documentation":
+  exec "nim doc --threads:on --path:src " & he3Path & " --outdir:doc/htmldocs/product src/tsuki/agent.nim"
+  exec "nim doc --path:packages/he3/src --outdir:doc/htmldocs packages/he3/src/he3.nim"
+  exec "nim doc --threads:on --path:packages/he3/src --outdir:doc/htmldocs packages/he3/src/he3/agent.nim"
 
 task bench, "run he3 benchmarks":
-  prepareBuildDir("bench")
-  exec "nim c -r --threads:on -d:release --path:src --nimcache:build/nimcache/bench --out:build/bench/tui bench/tui/bench.nim"
+  he3Task("bench")
 
 task fuzz, "run bounded deterministic fuzz/property smoke tests":
-  prepareBuildDir("tests")
-  exec "nim c -r --threads:on -d:release --path:src --nimcache:build/nimcache/fuzz --out:build/tests/fuzz tests/tui/t16safety.nim"
+  he3Task("fuzz")
 
 task examples, "compile every public example":
   prepareBuildDir("examples")
@@ -89,6 +87,6 @@ task examples, "compile every public example":
   if exampleCount != 3:
     raise newException(IOError,
       "expected exactly three public examples, found " & $exampleCount)
-  exec "nim c --threads:on --path:src --nimcache:build/nimcache/example-hello --out:build/examples/hello_world examples/hello_world.nim"
-  exec "nim c --threads:on --path:src --nimcache:build/nimcache/example-counter --out:build/examples/counter examples/counter.nim"
-  exec "nim c --threads:on --path:src --nimcache:build/nimcache/example-agent --out:build/examples/agent_chat examples/agent_chat.nim"
+  exec "nim c --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/example-hello --out:build/examples/hello_world examples/hello_world.nim"
+  exec "nim c --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/example-counter --out:build/examples/counter examples/counter.nim"
+  exec "nim c --threads:on --path:src " & he3Path & " --nimcache:build/nimcache/example-agent --out:build/examples/agent_chat examples/agent_chat.nim"

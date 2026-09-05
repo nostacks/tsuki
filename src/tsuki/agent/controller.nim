@@ -32,6 +32,7 @@ type
     adapter*: ProviderAdapter
     toolsEnabled*: bool
     toolsConfigured*: bool
+    reasoningEffort*: string
 
   ControllerEventKind* = enum
     controllerUserMessage
@@ -53,6 +54,7 @@ type
     controllerSessionRenamed
     controllerSessionsChanged
     controllerModelsChanged
+    controllerConfirmed
 
   ControllerEvent* = object
     kind*: ControllerEventKind
@@ -72,6 +74,8 @@ type
     success*: bool
     providerId*: ProviderId
     modelId*: ModelId
+    directory*: string
+    reasoningEffort*: string
     contextUsed*: int64
     contextLimit*: int64
     offline*: bool
@@ -112,6 +116,7 @@ type
     activeToken: CancellationToken
     activeTurn: TurnId
     pendingSubmits: int
+    contextUsed: int64
     cancelBeforeStart: bool
     shuttingDown: bool
     lastSaveMs: int64
@@ -165,11 +170,10 @@ proc close*(queue: ControllerQueue) =
 
 proc defaultWait(milliseconds: int,
     token: CancellationToken) {.gcsafe.} =
-  var remaining = max(0, milliseconds)
-  while remaining > 0 and not token.isCancelled:
-    let amount = min(50, remaining)
-    sleep(amount)
-    dec remaining, amount
+  if token.isNil:
+    sleep(max(0, milliseconds))
+  else:
+    discard token.waitCancel(milliseconds)
 
 func defaultRetryPolicy*(): RetryPolicy =
   RetryPolicy(maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 4_000,
@@ -202,10 +206,13 @@ proc send(controller: AgentController, event: ControllerEvent) =
   if not controller.emit.isNil: controller.emit(event)
 
 proc postStatus(controller: AgentController, message = "", offline = false,
-    saving = false, contextUsed = 0'i64) =
+    saving = false, contextUsed = -1'i64) =
+  if contextUsed >= 0: controller.contextUsed = contextUsed
   controller.send ControllerEvent(kind: controllerStatus, text: message,
     providerId: controller.session.providerId,
-    modelId: controller.session.modelId, contextUsed: contextUsed,
+    modelId: controller.session.modelId, contextUsed: controller.contextUsed,
+    directory: controller.session.workspaceRoot,
+    reasoningEffort: controller.session.reasoningEffort,
     contextLimit: controller.model.contextWindow, offline: offline,
     saving: saving)
 
@@ -306,7 +313,7 @@ proc finishAttempt(controller: AgentController, turn: TurnId,
   # Publishes the post-turn context picture so the status bar reflects the
   # durable session rather than the last streaming estimate.
   controller.postStatus(if state == turnCompleted: "ready" else: "idle",
-    contextUsed = usage.inputTokens)
+    contextUsed = if usage.totalTokens > 0: usage.totalTokens else: -1)
   if state == turnCancelled:
     controller.send ControllerEvent(kind: controllerTurnCancelled,
       id: if index >= 0: $controller.session.messages[index].id else: $turn)
@@ -371,27 +378,43 @@ proc executeTools(controller: AgentController, turn: TurnId,
   discard controller.transition(turnStreaming)
   true
 
-proc executeTurn(controller: AgentController, prompt: string,
-    retryOf = TurnId("")) =
+proc clearActive(controller: AgentController) =
   acquire(controller.lock)
-  if controller.pendingSubmits > 0: dec controller.pendingSubmits
-  let cancelBeforeStart = controller.cancelBeforeStart
-  controller.cancelBeforeStart = false
+  controller.activeToken = nil
+  controller.activeTurn = TurnId("")
+  release(controller.lock)
+
+proc executeTurn(controller: AgentController, prompt: string,
+    retryOf = TurnId(""), fromSubmit = false) =
+  ## The token becomes active before any other work so a cancel arriving
+  ## between the queue pop and the first provider call is never lost.
+  let turn = TurnId(freshId("t-"))
+  let token = initCancellationToken()
+  acquire(controller.lock)
+  if fromSubmit and controller.pendingSubmits > 0:
+    dec controller.pendingSubmits
+  if controller.cancelBeforeStart:
+    controller.cancelBeforeStart = false
+    token.cancel()
+  controller.activeToken = token
+  controller.activeTurn = turn
   release(controller.lock)
   if not controller.state.terminal:
+    controller.clearActive()
     controller.send ControllerEvent(kind: controllerNotice,
       id: "turn-busy", text: "A foreground turn is already active.")
     return
   if $controller.model.id == "" or not controller.model.available:
+    controller.clearActive()
     controller.send ControllerEvent(kind: controllerError,
       id: "model-unavailable", text: "Select an available model before sending.")
     controller.postStatus("offline", offline = true)
     return
-  let turn = TurnId(freshId("t-"))
   let now = unixTimeMs()
   var parts = @[textPart(prompt)]
   for attachment in controller.staged:
     if controller.model.capabilities.imageInput == capabilityUnsupported:
+      controller.clearActive()
       controller.send ControllerEvent(kind: controllerError,
         id: "image-unsupported", text: "The selected model does not support " &
           "image input.")
@@ -403,6 +426,7 @@ proc executeTurn(controller: AgentController, prompt: string,
     let checked = validateUnchanged(controller.session.workspaceRoot,
       attachment, controller.limits)
     if checked.error.len > 0:
+      controller.clearActive()
       controller.send ControllerEvent(kind: controllerError,
         id: "attachment-changed", text: checked.error)
       return
@@ -418,12 +442,6 @@ proc executeTurn(controller: AgentController, prompt: string,
   if controller.session.messages.len == 1:
     controller.session.title = initialSessionTitle(prompt)
   discard controller.transition(turnStarting)
-  acquire(controller.lock)
-  controller.activeToken = initCancellationToken()
-  controller.activeTurn = turn
-  let token = controller.activeToken
-  if cancelBeforeStart: token.cancel()
-  release(controller.lock)
   var toolDeadline: MonoTime
   controller.toolPolicy.cancelled = proc (): bool {.gcsafe.} =
     token.isCancelled or toolDeadline != MonoTime() and
@@ -445,7 +463,7 @@ proc executeTurn(controller: AgentController, prompt: string,
       discard controller.transition(turnCancelling)
       controller.finishAttempt(turn, turnCancelled, messageCancelled, usage)
       return
-    let projection = projectRequest(controller.session, controller.model,
+    var projection = projectRequest(controller.session, controller.model,
       limits = controller.limits,
       toolsEnabled = controller.toolPolicy.enabled)
     if projection.error.len > 0:
@@ -461,8 +479,9 @@ proc executeTurn(controller: AgentController, prompt: string,
     let request = ProviderRequest(sessionId: controller.session.id,
       turnId: turn, providerId: controller.session.providerId,
       model: controller.model, workspaceRoot: controller.session.workspaceRoot,
-      systemInstruction: projection.systemInstruction,
-      messages: projection.messages,
+      reasoningEffort: controller.session.reasoningEffort,
+      systemInstruction: move(projection.systemInstruction),
+      messages: move(projection.messages),
       tools: if controller.toolPolicy.enabled: readOnlyToolDefinitions(
           ) else: @[],
       maxOutputTokens: int(if controller.model.maxOutputTokens > 0:
@@ -474,7 +493,8 @@ proc executeTurn(controller: AgentController, prompt: string,
     var failure: ProviderError
     while attempt <= max(1, controller.retryPolicy.maxAttempts):
       if attempt > 1:
-        let exponential = controller.retryPolicy.baseDelayMs shl (attempt - 2)
+        let exponential = min(controller.retryPolicy.maxDelayMs,
+          controller.retryPolicy.baseDelayMs shl min(attempt - 2, 16))
         let hinted = if failure.retryAfterMs > 0:
           min(int64(int.high), failure.retryAfterMs).int else: exponential
         let delay = min(controller.retryPolicy.maxDelayMs, hinted)
@@ -514,7 +534,11 @@ proc executeTurn(controller: AgentController, prompt: string,
           pendingCalls.add event.toolCall
           let index = controller.ensureAssistant(turn)
           controller.session.messages[index].parts.add callPart(event.toolCall)
-        of providerUsage: usage = event.usage
+        of providerUsage:
+          usage = event.usage
+          if event.contextLimit > 0:
+            controller.model.contextWindow = event.contextLimit
+          controller.postStatus("streaming", contextUsed = usage.totalTokens)
         of providerRateLimitUpdate:
           controller.send ControllerEvent(kind: controllerRateLimit,
             rateLimitRemaining: event.rateLimitRemaining,
@@ -703,6 +727,13 @@ proc emitSession(controller: AgentController) =
         id: $message.id, text: message.messageText)
   controller.send ControllerEvent(kind: controllerTurnFinished,
     id: "session:" & $controller.session.id)
+  controller.contextUsed = 0
+  for index in countdown(controller.session.messages.len - 1, 0):
+    let message = controller.session.messages[index]
+    if message.role == messageAssistant:
+      controller.contextUsed = max(0'i64, message.usage.totalTokens)
+      break
+  controller.postStatus("ready")
 
 proc post*(controller: AgentController, command: sink ControllerCommand): bool =
   if controller.isNil: return false
@@ -727,7 +758,7 @@ proc post*(controller: AgentController, command: sink ControllerCommand): bool =
 proc handle(controller: AgentController, command: ControllerCommand) =
   case command.kind
   of commandSubmit:
-    controller.executeTurn(command.text)
+    controller.executeTurn(command.text, fromSubmit = true)
   of commandCancel:
     if controller.state.terminal:
       controller.send ControllerEvent(kind: controllerNotice,
@@ -755,6 +786,11 @@ proc handle(controller: AgentController, command: ControllerCommand) =
     if not controller.state.terminal:
       controller.send ControllerEvent(kind: controllerNotice,
         id: "model-busy", text: "Cancel the active turn before switching models.")
+    elif command.reasoningEffort.len > 0 and
+        command.reasoningEffort notin command.model.reasoningEfforts:
+      controller.send ControllerEvent(kind: controllerError,
+        id: "reasoning-unavailable",
+        text: "This model does not support the selected reasoning level.")
     elif not command.model.available:
       controller.send ControllerEvent(kind: controllerError,
         id: "model-unavailable", text: command.model.unavailableReason)
@@ -771,6 +807,7 @@ proc handle(controller: AgentController, command: ControllerCommand) =
         return
       controller.adapter = nextAdapter
       controller.model = command.model
+      controller.session.reasoningEffort = command.reasoningEffort
       if command.toolsConfigured:
         controller.hostToolsEnabled = command.toolsEnabled
       controller.session.providerId = command.model.providerId
@@ -782,6 +819,10 @@ proc handle(controller: AgentController, command: ControllerCommand) =
       let validation = controller.adapter.validate()
       if validation.ok:
         controller.postStatus("model selected")
+        controller.send ControllerEvent(kind: controllerConfirmed,
+          id: "model-selected", text: "Model set to " &
+            controller.adapter.displayName & " / " &
+            command.model.displayName)
       else:
         controller.postStatus(validation.message, offline = true)
   of commandSwitchSession:
@@ -825,9 +866,11 @@ proc handle(controller: AgentController, command: ControllerCommand) =
   of commandNewSession:
     if controller.state.terminal:
       discard controller.checkpoint(force = true)
+      let effort = controller.session.reasoningEffort
       controller.session = newSession(generateSessionId(),
         controller.session.workspaceRoot, controller.session.providerId,
         controller.session.modelId)
+      controller.session.reasoningEffort = effort
       controller.staged.setLen 0
       controller.state = turnIdle
       discard controller.checkpoint(force = true)

@@ -1,4 +1,4 @@
-import std/[asyncdispatch, asynchttpserver, httpcore, strutils, unittest]
+import std/[asyncdispatch, asynchttpserver, httpcore, json, strutils, unittest]
 import tsuki/agent
 
 proc main() =
@@ -6,6 +6,7 @@ proc main() =
   server.listen(Port(0), "127.0.0.1")
   let baseUrl = "http://127.0.0.1:" & $server.getPort.uint16 & "/v1"
   var sawOpenRouterTitle = false
+  var wireRequests: seq[JsonNode]
 
   proc respond(request: Request) {.async, gcsafe.} =
     if request.url.path == "/v1/models":
@@ -15,7 +16,8 @@ proc main() =
         """{"data":[{"id":"fixture-model","name":"Fixture model",
           "context_length":131072,
           "architecture":{"input_modalities":["text","image"]},
-          "supported_parameters":["tools","temperature"],
+          "supported_parameters":["tools","temperature","reasoning"],
+          "reasoning":{"supported_efforts":["high","low"],"default_effort":"low"},
           "top_provider":{"max_completion_tokens":8192}}]}""",
         newHttpHeaders({"Content-Type": "application/json"}))
     elif request.body.contains("\"model\":\"cancel\""):
@@ -27,6 +29,7 @@ proc main() =
         "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
         newHttpHeaders({"Content-Type": "text/event-stream"}))
     else:
+      wireRequests.add parseJson(request.body)
       await request.respond(Http200,
         "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n" &
         "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}," &
@@ -39,7 +42,7 @@ proc main() =
           "X-RateLimit-Limit-Requests": "10"}))
 
   proc serveRequests() {.async.} =
-    for requestIndex in 0 ..< 5:
+    for requestIndex in 0 ..< 6:
       discard requestIndex
       await server.acceptRequest(respond)
 
@@ -64,7 +67,7 @@ proc main() =
       var usage: NormalizedUsage
       var remaining = -1'i64
       let request = ProviderRequest(providerId: adapter.id,
-        model: configured, workspaceRoot: ".",
+        model: configured, workspaceRoot: ".", reasoningEffort: "high",
         messages: @[Message(role: messageUser,
           parts: @[textPart("hello")], status: messageComplete)])
       let failure = adapter.stream(request, initCancellationToken(),
@@ -81,6 +84,8 @@ proc main() =
       check completed
       check usage.totalTokens == 4
       check remaining == 9
+      check wireRequests[^1]{"reasoning_effort"}.getStr == "high"
+      check not wireRequests[^1].hasKey("reasoning")
 
     test "OpenRouter discovery maps provider model metadata":
       let discovered = openRouter.refreshModels(initCancellationToken())
@@ -93,6 +98,15 @@ proc main() =
         check model.maxOutputTokens == 8_192
         check model.capabilities.imageInput == capabilitySupported
         check model.capabilities.tools == capabilitySupported
+        check model.reasoningEfforts == @["high", "low"]
+        check model.defaultReasoningEffort == "low"
+        let request = ProviderRequest(providerId: openRouter.id, model: model,
+          workspaceRoot: ".", reasoningEffort: "low",
+          messages: @[Message(role: messageUser, parts: @[textPart("reason")])])
+        check openRouter.stream(request, initCancellationToken(),
+          proc (event: ProviderEvent): bool {.gcsafe.} = true).ok
+        check wireRequests[^1]{"reasoning"}{"effort"}.getStr == "low"
+        check not wireRequests[^1].hasKey("reasoning_effort")
       check sawOpenRouterTitle
 
     test "classifies an unexpected EOF as a retryable transport failure":

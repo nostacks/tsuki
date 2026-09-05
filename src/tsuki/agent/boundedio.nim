@@ -28,16 +28,23 @@ proc readBoundedRegularFile*(path: string, maxBytes: int): BoundedFileRead =
         openedInfo.id != pathInfo.id:
       result.error = "file changed before it could be read"
       return
-    var buffer = newString(if maxBytes == 0: 1
-      else: min(64 * 1024, maxBytes))
+    var total = 0
+    result.data = newString(int(pathInfo.size))
     while true:
-      let amount = file.readBuffer(addr buffer[0], buffer.len)
+      if total == result.data.len:
+        if total >= maxBytes:
+          var probe: char
+          if file.readBuffer(addr probe, 1) > 0:
+            result.data.setLen 0
+            result.error = "file exceeds the configured byte limit"
+            return
+          break
+        result.data.setLen(min(maxBytes, max(total * 2, total + 4096)))
+      let amount = file.readBuffer(addr result.data[total],
+        result.data.len - total)
       if amount <= 0: break
-      if amount > maxBytes - min(maxBytes, result.data.len):
-        result.data.setLen 0
-        result.error = "file exceeds the configured byte limit"
-        return
-      result.data.add buffer[0 ..< amount]
+      total += amount
+    result.data.setLen(total)
     let after = getFileInfo(file)
     if after.id != openedInfo.id or after.size != openedInfo.size or
         after.lastWriteTime != openedInfo.lastWriteTime:

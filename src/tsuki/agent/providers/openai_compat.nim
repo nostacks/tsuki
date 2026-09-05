@@ -4,6 +4,8 @@ import std/[asyncdispatch, asyncstreams, base64, httpclient, json, monotimes,
   net, os, sets, strutils, tables, times, uri]
 import ../[boundedio, config, limits, pathpolicy, provider, types]
 
+const terminalGraceMs = 2_000
+
 type
   SseParser* = object
     buffer: string
@@ -69,6 +71,20 @@ func discoveredModel(adapter: OpenAICompatProvider,
     result.contextWindow = node.positiveInt64("context_length")
     result.maxOutputTokens = node{"top_provider"}.positiveInt64(
       "max_completion_tokens")
+    let reasoning = node{"reasoning"}
+    let efforts = reasoning{"supported_efforts"}
+    if not efforts.isNil:
+      if efforts.kind == JArray:
+        for effort in efforts: result.addReasoningEffort(effort.getStr)
+      elif efforts.kind == JNull:
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"]:
+          result.addReasoningEffort(effort)
+      if reasoning{"mandatory"}.getBool(false):
+        let disabled = result.reasoningEfforts.find("none")
+        if disabled >= 0: result.reasoningEfforts.delete(disabled)
+    let defaultEffort = reasoning{"default_effort"}.getStr
+    if defaultEffort in result.reasoningEfforts:
+      result.defaultReasoningEffort = defaultEffort
 
 proc waitUntil[T](future: Future[T], deadline: MonoTime,
     token: CancellationToken): T =
@@ -132,14 +148,21 @@ proc feed*(parser: var SseParser, chunk: string,
     events: var seq[string]): string =
   ## Parses arbitrary byte chunks; only complete UTF-8 JSON events escape it.
   parser.buffer.add chunk
+  var start = 0
   while true:
-    let newline = parser.buffer.find('\n')
+    let newline = parser.buffer.find('\n', start)
     if newline < 0: break
-    var line = parser.buffer[0 ..< newline]
-    parser.buffer.delete(0 .. newline)
-    if line.endsWith("\r"): line.setLen(line.len - 1)
-    result = parser.processLine(line, events)
-    if result.len > 0: return
+    var stop = newline
+    if stop > start and parser.buffer[stop - 1] == '\r': dec stop
+    result = parser.processLine(parser.buffer[start ..< stop], events)
+    start = newline + 1
+    if result.len > 0: break
+  if start > 0:
+    if start >= parser.buffer.len:
+      parser.buffer.setLen 0
+    else:
+      parser.buffer = parser.buffer[start .. ^1]
+  if result.len > 0: return
   if parser.buffer.len > parser.maxLineBytes:
     return "provider event line exceeded the configured bound"
 
@@ -307,7 +330,8 @@ proc wireContent(part: ContentPart, workspaceRoot: string,
   of contentToolCall, contentToolResult:
     newJNull()
 
-proc requestJson(request: ProviderRequest, maxImageBytes: int): string =
+proc requestJson(request: ProviderRequest, maxImageBytes: int,
+    openRouter = false): string =
   var messages = newJArray()
   if request.systemInstruction.len > 0:
     messages.add %*{"role": "system", "content": request.systemInstruction}
@@ -342,6 +366,11 @@ proc requestJson(request: ProviderRequest, maxImageBytes: int): string =
         else: "system", "content": content}
   var root = %*{"model": $request.model.id, "stream": true,
     "stream_options": {"include_usage": true}, "messages": messages}
+  if request.reasoningEffort.len > 0:
+    if openRouter:
+      root["reasoning"] = %*{"effort": request.reasoningEffort}
+    else:
+      root["reasoning_effort"] = %request.reasoningEffort
   if request.maxOutputTokens > 0:
     root["max_tokens"] = %request.maxOutputTokens
   if request.tools.len > 0:
@@ -372,6 +401,15 @@ proc normalizedUsage(node: JsonNode): NormalizedUsage =
 func endpoint(base, path: string): string =
   base.strip(chars = {'/'}) & path
 
+proc retryAfterMs(headers: HttpHeaders): int64 =
+  ## Reads a delay-seconds `Retry-After`; HTTP-date forms are ignored.
+  let value = headers.getOrDefault("retry-after").strip()
+  if value.len == 0 or value.len > 9: return 0
+  try:
+    result = min(parseBiggestInt(value), 3_600'i64) * 1_000
+  except ValueError:
+    result = 0
+
 method stream*(adapter: OpenAICompatProvider, request: ProviderRequest,
     token: CancellationToken,
     emit: ProviderEventProc): ProviderError {.gcsafe.} =
@@ -391,7 +429,8 @@ method stream*(adapter: OpenAICompatProvider, request: ProviderRequest,
     return ProviderError(kind: providerUnsupportedFeature,
       message: "selected model does not support streaming")
   try:
-    let body = requestJson(request, phase1Limits().maxImageBytes)
+    let body = requestJson(request, phase1Limits().maxImageBytes,
+      adapter.kind == "openrouter")
     if body.len > phase1Limits().maxRequestBytes:
       return ProviderError(kind: providerUnsupportedFeature,
         message: "provider request exceeded the configured byte limit")
@@ -416,7 +455,7 @@ method stream*(adapter: OpenAICompatProvider, request: ProviderRequest,
         try: detail = parseJson(bounded.data).errorMessage
         except JsonParsingError: discard
       return classifyHttpError(int(response.code),
-        redact(detail, [adapter.credential]))
+        redact(detail, [adapter.credential]), response.headers.retryAfterMs)
     var remaining = -1'i64
     var requestLimit = -1'i64
     try:
@@ -439,10 +478,12 @@ method stream*(adapter: OpenAICompatProvider, request: ProviderRequest,
     var total = 0
     var calls = initTable[int, ToolCall]()
     var sawTerminal = false
+    var sawDone = false
 
     proc consume(data: string): ProviderError =
       if data == "[DONE]":
         sawTerminal = true
+        sawDone = true
         return
       let node = parseJson(data)
       if node.isNil or node.kind != JObject:
@@ -450,7 +491,7 @@ method stream*(adapter: OpenAICompatProvider, request: ProviderRequest,
           message: "provider event must be a JSON object")
       if node.hasKey("error"):
         return ProviderError(kind: providerMalformedResponse,
-          message: node.errorMessage)
+          message: redact(node.errorMessage, [adapter.credential]))
       if node.hasKey("usage") and node["usage"].kind == JObject:
         if not emit(usageEvent(node["usage"].normalizedUsage)):
           token.cancel()
@@ -489,8 +530,18 @@ method stream*(adapter: OpenAICompatProvider, request: ProviderRequest,
       if token.isCancelled:
         discard emit(cancelledEvent())
         return ProviderError(kind: providerCancelled, message: "cancelled")
-      let (hasData, chunk) = response.bodyStream.read().waitUntil(
-        deadline.readDeadline(adapter.idleStreamTimeoutMs), token)
+      var readUntil = deadline.readDeadline(adapter.idleStreamTimeoutMs)
+      if sawTerminal:
+        readUntil = min(readUntil, getMonoTime() + initDuration(
+          milliseconds = terminalGraceMs))
+      var hasData: bool
+      var chunk: string
+      try:
+        (hasData, chunk) = response.bodyStream.read().waitUntil(readUntil,
+          token)
+      except TimeoutError:
+        if sawTerminal: break
+        raise
       if not hasData: break
       total += chunk.len
       if total > adapter.maxResponseBytes:
@@ -504,7 +555,7 @@ method stream*(adapter: OpenAICompatProvider, request: ProviderRequest,
       for data in events:
         let eventError = consume(data)
         if not eventError.ok: return eventError
-      if sawTerminal: break
+      if sawDone: break
     var finalEvents: seq[string]
     let finalError = parser.finish(finalEvents)
     if finalError.len > 0:

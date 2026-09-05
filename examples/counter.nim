@@ -1,6 +1,6 @@
 ## A small centered counter on a solid light-gray terminal canvas.
 
-import tsuki/tui
+import he3
 
 type CounterTheme = object
   background: Style

@@ -1,8 +1,8 @@
 ## Safe projection from product controller events to the public he3 facade.
 
 import controller, types
-import ../tui/agent as ui
-from ../tui/agent/model import agentError
+import he3/agent as ui
+from he3/agent/model import agentError
 
 func uiAttachmentState(state: AttachmentState): ui.AttachmentViewState =
   case state
@@ -107,6 +107,7 @@ proc tuiEventSink*(chat: ui.AgentChat): ControllerEventProc =
       discard chat.post ui.statusUpdated(ui.AgentViewStatus(
         provider: $event.providerId, model: $event.modelId, mode: "agent",
         message: event.text, contextUsed: event.contextUsed,
+        directory: event.directory, reasoningEffort: event.reasoningEffort,
         contextLimit: event.contextLimit, offline: event.offline,
         saving: event.saving))
     of controllerAttachmentStaged:
@@ -119,5 +120,7 @@ proc tuiEventSink*(chat: ui.AgentChat): ControllerEventProc =
       discard chat.post ui.sessionReset(event.id, event.text)
     of controllerSessionRenamed:
       discard chat.post ui.sessionTitleUpdated(event.id, event.text)
+    of controllerConfirmed:
+      discard chat.post ui.toast(event.id, event.text)
     of controllerSessionsChanged, controllerModelsChanged:
       discard

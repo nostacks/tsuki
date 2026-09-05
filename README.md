@@ -19,12 +19,13 @@ he3 is fast and lightweight: zero third-party runtime dependencies, no idle
 polling, and sub-millisecond frame rendering in local release benchmarks.
 
 The long-term goal is for he3 to become a standard TUI framework for the Nim
-ecosystem. Its current import path is `tsuki/tui`.
+ecosystem. It is its own Nimble package under [`packages/he3`](packages/he3)
+and its import path is `he3`.
 
 ### Quick start
 
 ```nim
-import tsuki/tui
+import he3
 
 proc update(event: Event): Update =
   if event.isQuit: quitTui() else: unchanged()
@@ -41,7 +42,13 @@ Compile with threads enabled:
 nim c -r --threads:on app.nim
 ```
 
-Agent views are available from `tsuki/tui/agent`. Model and tool workers can
+Install he3 on its own with the `subdir` query:
+
+```sh
+nimble install "https://github.com/nostacks/tsuki?subdir=packages/he3"
+```
+
+Agent views are available from `he3/agent`. Model and tool workers can
 post typed events from other threads without coupling he3 to a provider.
 
 ## Install
@@ -83,14 +90,18 @@ nimble examples
 ## Development
 
 ```sh
-nimble test       # debug and release test suites
+nimble test       # product tests, then the he3 debug and release suites
 nimble examples   # compile every public example
 nimble fuzz       # bounded deterministic property tests
 nimble bench      # release benchmarks
 nimble docs       # generate API docs under doc/htmldocs
 ```
 
-Read the [he3 guide](doc/index.md), review the
+The same `test`, `fuzz`, `bench`, and `docs` tasks can be run directly inside
+`packages/he3`.
+
+Read the [he3 quick start](doc/index.md) or the full
+[he3 library guide](doc/he3.md), review the
 [terminal compatibility record](doc/manual-test.md), or see the
 [pre-1.0 migration notes](doc/migration.md).
 

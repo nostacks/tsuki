@@ -3,7 +3,7 @@
 import std/os
 import std/typedthreads
 import tsuki/agent
-import tsuki/tui/agent
+import he3/agent
 
 type Shared = object
   controller: AgentController
@@ -78,6 +78,7 @@ proc handleAction(action: AgentAction) =
     discard
 
 let options = agentTuiOptions(status = AgentStatus(provider: "mock",
+  directory: workspace,
   model: $model.id, mode: "agent", message: "offline demo"),
   selectorEntries = @[SelectorEntry(providerId: "mock", providerName: "Mock",
     modelId: $model.id, displayName: model.displayName,

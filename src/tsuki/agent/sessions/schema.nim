@@ -1,69 +1,156 @@
 ## Explicit version-1 durable session JSON encoding and bounded decoding.
 
-import std/[json, os, strutils]
+import std/[json, os, parsejson, streams, strutils]
 import ../[limits, types]
 
-type SessionDecodeResult* = object
-  session*: Session
-  error*: string
-  futureVersion*: bool
+type
+  SessionDecodeResult* = object
+    session*: Session
+    error*: string
+    futureVersion*: bool
+
+  SessionHeader* = object
+    ## The listing view of one session document, decoded without building
+    ## its messages.
+    id*: SessionId
+    title*: string
+    workspaceRoot*: string
+    updatedAtMs*: int64
+    providerId*: ProviderId
+    modelId*: ModelId
+    interrupted*: bool
+    archived*: bool
+
+  SessionHeaderResult* = object
+    header*: SessionHeader
+    error*: string
+    futureVersion*: bool
+
+const
+  inFlightStates = {turnStarting, turnStreaming, turnAwaitingTool,
+    turnRetrying, turnCancelling}
+  maxNestingDepth = 256
 
 func enumValue[T: enum](value: string, fallback: T): T =
   try: parseEnum[T](value)
   except ValueError: fallback
 
-proc imageJson(image: ImageReference): JsonNode =
-  %*{"id": $image.id, "path": image.path, "location": $image.location,
-    "displayName": image.displayName, "mediaType": image.mediaType,
-    "sizeBytes": image.sizeBytes, "width": image.width,
-    "height": image.height, "modifiedAtMs": image.modifiedAtMs,
-    "altText": image.altText, "state": $image.state}
+proc putKey(output: var string, key: string) =
+  if output[^1] notin {'{', '['}: output.add ','
+  output.add '"'
+  output.add key
+  output.add "\":"
 
-proc partJson(part: ContentPart): JsonNode =
+proc putString(output: var string, key, value: string) =
+  output.putKey key
+  escapeJson(value, output)
+
+proc putInt(output: var string, key: string, value: int64) =
+  output.putKey key
+  output.addInt value
+
+proc putBool(output: var string, key: string, value: bool) =
+  output.putKey key
+  output.add(if value: "true" else: "false")
+
+proc putImage(output: var string, image: ImageReference) =
+  output.add '{'
+  output.putString "id", $image.id
+  output.putString "path", image.path
+  output.putString "location", $image.location
+  output.putString "displayName", image.displayName
+  output.putString "mediaType", image.mediaType
+  output.putInt "sizeBytes", image.sizeBytes
+  output.putInt "width", image.width
+  output.putInt "height", image.height
+  output.putInt "modifiedAtMs", image.modifiedAtMs
+  output.putString "altText", image.altText
+  output.putString "state", $image.state
+  output.add '}'
+
+proc putPart(output: var string, part: ContentPart) =
+  output.add '{'
+  output.putString "kind", $part.kind
   case part.kind
   of contentText, contentVisibleSummary:
-    %*{"kind": $part.kind, "text": part.text}
+    output.putString "text", part.text
   of contentImageReference:
-    %*{"kind": $part.kind, "image": part.image.imageJson}
+    output.putKey "image"
+    output.putImage part.image
   of contentToolCall:
-    %*{"kind": $part.kind, "call": {"id": $part.toolCall.id,
-      "name": part.toolCall.name, "argumentsJson":
-      part.toolCall.argumentsJson}}
+    output.putKey "call"
+    output.add '{'
+    output.putString "id", $part.toolCall.id
+    output.putString "name", part.toolCall.name
+    output.putString "argumentsJson", part.toolCall.argumentsJson
+    output.add '}'
   of contentToolResult:
-    %*{"kind": $part.kind, "result": {"callId": $part.toolResult.callId,
-      "name": part.toolResult.name, "content": part.toolResult.content,
-      "success": part.toolResult.success,
-      "truncated": part.toolResult.truncated,
-      "errorCode": part.toolResult.errorCode}}
+    output.putKey "result"
+    output.add '{'
+    output.putString "callId", $part.toolResult.callId
+    output.putString "name", part.toolResult.name
+    output.putString "content", part.toolResult.content
+    output.putBool "success", part.toolResult.success
+    output.putBool "truncated", part.toolResult.truncated
+    output.putString "errorCode", part.toolResult.errorCode
+    output.add '}'
+  output.add '}'
 
-proc messageJson(message: Message): JsonNode =
-  var parts = newJArray()
-  for part in message.parts: parts.add part.partJson
-  %*{"id": $message.id, "turnId": $message.turnId, "role": $message.role,
-    "parts": parts, "createdAtMs": message.createdAtMs,
-    "finishedAtMs": message.finishedAtMs, "status": $message.status,
-    "providerId": $message.providerId, "modelId": $message.modelId,
-    "retryOf": $message.retryOf, "usage": {
-      "inputTokens": message.usage.inputTokens,
-      "outputTokens": message.usage.outputTokens,
-      "cachedTokens": message.usage.cachedTokens,
-      "totalTokens": message.usage.totalTokens}}
+proc putMessage(output: var string, message: Message) =
+  output.add '{'
+  output.putString "id", $message.id
+  output.putString "turnId", $message.turnId
+  output.putString "role", $message.role
+  output.putKey "parts"
+  output.add '['
+  for part in message.parts:
+    if output[^1] != '[': output.add ','
+    output.putPart part
+  output.add ']'
+  output.putInt "createdAtMs", message.createdAtMs
+  output.putInt "finishedAtMs", message.finishedAtMs
+  output.putString "status", $message.status
+  output.putString "providerId", $message.providerId
+  output.putString "modelId", $message.modelId
+  output.putString "retryOf", $message.retryOf
+  output.putKey "usage"
+  output.add '{'
+  output.putInt "inputTokens", message.usage.inputTokens
+  output.putInt "outputTokens", message.usage.outputTokens
+  output.putInt "cachedTokens", message.usage.cachedTokens
+  output.putInt "totalTokens", message.usage.totalTokens
+  output.add '}'
+  output.add '}'
 
 proc encodeSession*(session: Session): string =
-  ## Encodes only canonical product state—never credentials or terminal state.
-  var messages = newJArray()
-  for message in session.messages: messages.add message.messageJson
-  var attachments = newJArray()
+  ## Encodes only canonical product state, never credentials or terminal
+  ## state. The document is written directly, without a JSON tree.
+  result = newStringOfCap(4096)
+  result.add '{'
+  result.putInt "schemaVersion", currentSessionSchemaVersion
+  result.putString "id", $session.id
+  result.putString "title", session.title
+  result.putString "workspaceRoot", session.workspaceRoot
+  result.putInt "createdAtMs", session.createdAtMs
+  result.putInt "updatedAtMs", session.updatedAtMs
+  result.putString "providerId", $session.providerId
+  result.putString "modelId", $session.modelId
+  result.putString "reasoningEffort", session.reasoningEffort
+  result.putKey "attachments"
+  result.add '['
   for attachment in session.stagedAttachments:
-    attachments.add attachment.imageJson
-  $(%*{"schemaVersion": currentSessionSchemaVersion,
-    "id": $session.id, "title": session.title,
-    "workspaceRoot": session.workspaceRoot,
-    "createdAtMs": session.createdAtMs, "updatedAtMs": session.updatedAtMs,
-    "providerId": $session.providerId, "modelId": $session.modelId,
-    "attachments": attachments, "messages": messages,
-    "lastTurnState": $session.lastTurnState,
-    "archived": session.archived})
+    if result[^1] != '[': result.add ','
+    result.putImage attachment
+  result.add ']'
+  result.putKey "messages"
+  result.add '['
+  for message in session.messages:
+    if result[^1] != '[': result.add ','
+    result.putMessage message
+  result.add ']'
+  result.putString "lastTurnState", $session.lastTurnState
+  result.putBool "archived", session.archived
+  result.add '}'
 
 proc boundedString(node: JsonNode, key: string, maxBytes: int,
     required = false): string =
@@ -174,6 +261,7 @@ proc decodeSession*(source: string,
       updatedAtMs: root{"updatedAtMs"}.getInt(0),
       providerId: ProviderId(root.boundedString("providerId", 256).safeId(256)),
       modelId: ModelId(root.boundedString("modelId", 1024).safeDisplay(1024)),
+      reasoningEffort: root.boundedString("reasoningEffort", 64).safeId(64),
       lastTurnState: enumValue(root{"lastTurnState"}.getStr, turnInterrupted),
       archived: root{"archived"}.getBool)
     if $result.session.id == "" or result.session.workspaceRoot.len == 0:
@@ -205,12 +293,131 @@ proc decodeSession*(source: string,
             raise newException(ValueError,
               "session contains too many image references")
       result.session.messages.add parsed
-    if result.session.lastTurnState in {turnStarting, turnStreaming,
-        turnAwaitingTool, turnRetrying, turnCancelling}:
+    if result.session.lastTurnState in inFlightStates:
       result.session.lastTurnState = turnInterrupted
       for message in result.session.messages.mitems:
         if message.status == messagePartial:
           message.status = messageInterrupted
+  except JsonParsingError as failure:
+    result.error = "malformed session JSON: " & failure.msg.safeDisplay(1024)
+  except CatchableError as failure:
+    result.error = "invalid session: " & failure.msg.safeDisplay(1024)
+
+proc skipValue(parser: var JsonParser, depth: int) =
+  if depth > maxNestingDepth:
+    raise newException(ValueError, "session nesting is too deep")
+  case parser.tok
+  of tkCurlyLe:
+    discard getTok(parser)
+    while parser.tok != tkCurlyRi:
+      if parser.tok != tkString:
+        raiseParseErr(parser, "string literal as key")
+      discard getTok(parser)
+      eat(parser, tkColon)
+      skipValue(parser, depth + 1)
+      if parser.tok != tkComma: break
+      discard getTok(parser)
+    eat(parser, tkCurlyRi)
+  of tkBracketLe:
+    discard getTok(parser)
+    while parser.tok != tkBracketRi:
+      skipValue(parser, depth + 1)
+      if parser.tok != tkComma: break
+      discard getTok(parser)
+    eat(parser, tkBracketRi)
+  of tkString, tkInt, tkFloat, tkTrue, tkFalse, tkNull:
+    discard getTok(parser)
+  else:
+    raiseParseErr(parser, "value")
+
+proc takeString(parser: var JsonParser, key: string, maxBytes: int): string =
+  if parser.tok != tkString:
+    raise newException(ValueError, "field must be a string: " & key)
+  if parser.a.len > maxBytes:
+    raise newException(ValueError, "field exceeds bound: " & key)
+  result = parser.a
+  discard getTok(parser)
+
+proc takeInt(parser: var JsonParser, key: string): int64 =
+  if parser.tok != tkInt:
+    raise newException(ValueError, "field must be an integer: " & key)
+  result = parseBiggestInt(parser.a)
+  discard getTok(parser)
+
+proc decodeSessionHeader*(source: string,
+    limits = phase1Limits()): SessionHeaderResult =
+  ## Reads the listing fields of a session document while skipping its
+  ## messages, so scanning a large store never materializes transcripts.
+  if source.len > limits.maxSessionBytes:
+    result.error = "session exceeds the configured size bound"
+    return
+  var parser: JsonParser
+  parser.open(newStringStream(source), "session")
+  defer: parser.close()
+  try:
+    discard getTok(parser)
+    if parser.tok != tkCurlyLe:
+      raise newException(ValueError, "session root must be an object")
+    discard getTok(parser)
+    var version = 0'i64
+    var sawId, sawTitle, sawWorkspace = false
+    var lastTurnState = ""
+    while parser.tok != tkCurlyRi:
+      if parser.tok != tkString:
+        raiseParseErr(parser, "string literal as key")
+      let key = parser.a
+      discard getTok(parser)
+      eat(parser, tkColon)
+      case key
+      of "schemaVersion":
+        version = parser.takeInt(key)
+      of "id":
+        result.header.id = SessionId(parser.takeString(key, 256).safeId(256))
+        sawId = true
+      of "title":
+        result.header.title = parser.takeString(key, 4096).safeDisplay(4096)
+        sawTitle = true
+      of "workspaceRoot":
+        result.header.workspaceRoot = parser.takeString(key, 32 * 1024)
+        sawWorkspace = true
+      of "updatedAtMs":
+        result.header.updatedAtMs = parser.takeInt(key)
+      of "providerId":
+        result.header.providerId = ProviderId(
+          parser.takeString(key, 256).safeId(256))
+      of "modelId":
+        result.header.modelId = ModelId(
+          parser.takeString(key, 1024).safeDisplay(1024))
+      of "lastTurnState":
+        lastTurnState = parser.takeString(key, 64)
+      of "archived":
+        if parser.tok notin {tkTrue, tkFalse}:
+          raise newException(ValueError, "field must be a boolean: archived")
+        result.header.archived = parser.tok == tkTrue
+        discard getTok(parser)
+      else:
+        skipValue(parser, 1)
+      if parser.tok != tkComma: break
+      discard getTok(parser)
+    eat(parser, tkCurlyRi)
+    eat(parser, tkEof)
+    if version > currentSessionSchemaVersion:
+      result.futureVersion = true
+      result.error = "session schema is newer than this Tsuki build"
+      return
+    if version < 0:
+      result.error = "unsupported session schema"
+      return
+    if not sawId or not sawTitle or not sawWorkspace:
+      raise newException(ValueError, "session identity is incomplete")
+    if $result.header.id == "" or result.header.workspaceRoot.len == 0:
+      raise newException(ValueError, "session identity is incomplete")
+    if not isAbsolute(result.header.workspaceRoot):
+      raise newException(ValueError, "session workspace must be absolute")
+    result.header.workspaceRoot = normalizedPath(result.header.workspaceRoot)
+    let state = enumValue(lastTurnState, turnInterrupted)
+    result.header.interrupted = state == turnInterrupted or
+      state in inFlightStates
   except JsonParsingError as failure:
     result.error = "malformed session JSON: " & failure.msg.safeDisplay(1024)
   except CatchableError as failure:

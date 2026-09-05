@@ -3,12 +3,19 @@
 
 import std/[json, locks, monotimes, os, osproc, streams, strutils, times]
 import std/typedthreads
-import ../[limits, pathpolicy, provider, types]
+import ../[limits, pathpolicy, provider, timedwait, types]
+
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 
 const
   maxProtocolLineBytes = 4 * 1024 * 1024
   maxQueuedProtocolBytes = 8 * 1024 * 1024
   loginTimeoutMs = 10 * 60 * 1_000
+  readChunkBytes = 64 * 1024
+  tooMuchData = "Codex returned too much data. Try a shorter request."
 
 type
   CodexAppServerProvider* = ref object of ProviderAdapter
@@ -20,6 +27,7 @@ type
 
   LineQueue = ref object
     lock: Lock
+    changed: Cond
     lines: seq[string]
     head: int
     queuedBytes: int
@@ -27,7 +35,7 @@ type
     failure: string
 
   ReaderArgs = object
-    stream: Stream
+    handle: FileHandle
     queue: LineQueue
     discardOutput: bool
 
@@ -47,59 +55,88 @@ func protocolError(message: string,
 proc initLineQueue(): LineQueue =
   new(result)
   initLock(result.lock)
+  initCond(result.changed)
 
 proc push(queue: LineQueue, line: sink string) =
   acquire(queue.lock)
   defer: release(queue.lock)
   if queue.closed or queue.failure.len > 0: return
-  if line.len > maxProtocolLineBytes:
-    queue.failure = "Codex returned too much data. Try a shorter request."
-    return
-  if line.len > maxQueuedProtocolBytes - min(maxQueuedProtocolBytes,
-      queue.queuedBytes):
-    queue.failure = "Codex returned too much data. Try a shorter request."
+  if line.len > maxProtocolLineBytes or
+      line.len > maxQueuedProtocolBytes - min(maxQueuedProtocolBytes,
+        queue.queuedBytes):
+    queue.failure = tooMuchData
+    broadcast(queue.changed)
     return
   queue.queuedBytes += line.len
   queue.lines.add move(line)
+  signal(queue.changed)
+
+proc fail(queue: LineQueue, failure: string) =
+  acquire(queue.lock)
+  if queue.failure.len == 0:
+    queue.failure = failure.safeDisplay(1024)
+  broadcast(queue.changed)
+  release(queue.lock)
 
 proc finish(queue: LineQueue, failure = "") =
   acquire(queue.lock)
   if queue.failure.len == 0 and failure.len > 0:
     queue.failure = failure.safeDisplay(1024)
   queue.closed = true
+  broadcast(queue.changed)
   release(queue.lock)
 
+proc readChunk(handle: FileHandle, buffer: var array[readChunkBytes,
+    char]): int =
+  ## Pipe reads return whatever is available instead of filling the buffer.
+  when defined(windows):
+    var count: int32 = 0
+    if readFile(Handle(handle), addr buffer[0], int32(buffer.len),
+        addr count, nil) == 0:
+      return -1
+    int(count)
+  else:
+    while true:
+      let count = posix.read(cint(handle), addr buffer[0], buffer.len)
+      if count < 0 and errno == EINTR: continue
+      return int(count)
+
+proc appendBytes(line: var string, buffer: array[readChunkBytes, char],
+    start, stop: int) =
+  if stop <= start: return
+  let offset = line.len
+  line.setLen(offset + stop - start)
+  copyMem(addr line[offset], unsafeAddr buffer[start], stop - start)
+
 proc readerMain(args: ReaderArgs) {.thread.} =
+  var buffer: array[readChunkBytes, char]
   var line = ""
   var discarding = false
-  try:
-    while true:
-      var ch: char
-      let count = args.stream.readData(addr ch, 1)
-      if count <= 0: break
-      if ch == '\n':
-        if not discarding:
-          if line.endsWith("\r"): line.setLen(line.len - 1)
-          if not args.discardOutput: args.queue.push(move(line))
-        line = ""
-        discarding = false
-      elif not discarding:
-        if line.len >= maxProtocolLineBytes:
-          acquire(args.queue.lock)
-          if args.queue.failure.len == 0:
-            args.queue.failure =
-              "Codex returned too much data. Try a shorter request."
-          release(args.queue.lock)
-          line.setLen 0
-          discarding = true
-        else:
-          line.add ch
-    if line.len > 0 and not discarding and not args.discardOutput:
-      args.queue.push(move(line))
-    if not args.discardOutput: args.queue.finish()
-  except CatchableError:
-    if not args.discardOutput:
-      args.queue.finish("Lost the connection to Codex. Try again.")
+  while true:
+    let count = readChunk(args.handle, buffer)
+    if count <= 0: break
+    if args.discardOutput: continue
+    var start = 0
+    for index in 0 ..< count:
+      if buffer[index] != '\n': continue
+      if not discarding:
+        line.appendBytes(buffer, start, index)
+        if line.endsWith("\r"): line.setLen(line.len - 1)
+        args.queue.push(move(line))
+      line = ""
+      discarding = false
+      start = index + 1
+    if not discarding and start < count:
+      if line.len + count - start > maxProtocolLineBytes:
+        args.queue.fail(tooMuchData)
+        line.setLen 0
+        discarding = true
+      else:
+        line.appendBytes(buffer, start, count)
+  if args.discardOutput: return
+  if line.len > 0 and not discarding:
+    args.queue.push(move(line))
+  args.queue.finish()
 
 proc resolvedExecutable(adapter: CodexAppServerProvider): string =
   if adapter.executable.isAbsolute and fileExists(adapter.executable):
@@ -123,10 +160,10 @@ proc startConnection(adapter: CodexAppServerProvider,
     var outputStarted = false
     try:
       createThread(connection.reader, readerMain,
-        ReaderArgs(stream: process.outputStream, queue: connection.queue))
+        ReaderArgs(handle: process.outputHandle, queue: connection.queue))
       outputStarted = true
       createThread(connection.diagnosticReader, readerMain,
-        ReaderArgs(stream: process.errorStream, queue: connection.queue,
+        ReaderArgs(handle: process.errorHandle, queue: connection.queue,
           discardOutput: true))
     except CatchableError:
       try:
@@ -177,36 +214,44 @@ proc send(connection: CodexConnection, node: JsonNode): ProviderError =
     result = ProviderError(kind: providerTransport,
       message: "Could not write to the Codex App Server.", retryable: true)
 
-proc popLine(queue: LineQueue, line: var string, closed: var bool,
+proc awaitLine(queue: LineQueue, deadline: MonoTime,
+    token: CancellationToken, line: var string, closed: var bool,
     failure: var string): bool =
+  ## Blocks until a line, closure, failure, cancellation, or the deadline.
+  ## The token wakes this wait through the registered waiter.
+  let waiter = CancelWaiter(lock: addr queue.lock, cond: addr queue.changed)
+  token.addWaiter(waiter)
+  defer: token.removeWaiter(waiter)
   acquire(queue.lock)
   defer: release(queue.lock)
-  if queue.head < queue.lines.len:
-    line = move(queue.lines[queue.head])
-    queue.queuedBytes -= line.len
-    inc queue.head
-    if queue.head >= queue.lines.len:
-      queue.lines.setLen 0
-      queue.head = 0
-    result = true
-  closed = queue.closed
-  failure = queue.failure
+  while true:
+    if queue.head < queue.lines.len:
+      line = move(queue.lines[queue.head])
+      queue.queuedBytes -= line.len
+      inc queue.head
+      if queue.head >= queue.lines.len:
+        queue.lines.setLen 0
+        queue.head = 0
+      return true
+    closed = queue.closed
+    failure = queue.failure
+    if closed or failure.len > 0 or token.isCancelled: return false
+    let remaining = (deadline - getMonoTime()).inMilliseconds
+    if remaining <= 0: return false
+    discard timedWait(queue.changed, queue.lock, int(min(remaining,
+      int64(high(int32)))))
 
 proc nextJson(connection: CodexConnection, deadline: MonoTime,
     token: CancellationToken): tuple[node: JsonNode,
     error: ProviderError] =
-  while getMonoTime() < deadline:
-    if token.isCancelled:
-      result.error = ProviderError(kind: providerCancelled,
-        message: "cancelled")
-      return
+  while true:
     var line, queueFailure: string
     var closed = false
-    if connection.queue.popLine(line, closed, queueFailure):
+    if connection.queue.awaitLine(deadline, token, line, closed,
+        queueFailure):
       connection.consumedBytes += line.len
       if connection.consumedBytes > connection.maxResponseBytes:
-        result.error = protocolError(
-          "Codex returned too much data. Try a shorter request.")
+        result.error = protocolError(tooMuchData)
         return
       if line.strip.len == 0: continue
       try:
@@ -216,18 +261,21 @@ proc nextJson(connection: CodexConnection, deadline: MonoTime,
           return
       except JsonParsingError:
         discard
+      continue
+    if token.isCancelled:
+      result.error = ProviderError(kind: providerCancelled,
+        message: "cancelled")
     elif queueFailure.len > 0:
       result.error = protocolError(queueFailure)
-      return
     elif closed:
       result.error = ProviderError(kind: providerTransport,
         message: "Codex closed the connection. Try again.",
         retryable: true)
-      return
     else:
-      sleep(10)
-  result.error = ProviderError(kind: providerTimeout,
-    message: "Codex took too long to respond. Try again.", retryable: true)
+      result.error = ProviderError(kind: providerTimeout,
+        message: "Codex took too long to respond. Try again.",
+        retryable: true)
+    return
 
 func rpcFailure(node: JsonNode): ProviderError =
   let error = node{"error"}
@@ -279,12 +327,19 @@ func modelDescriptor(adapter: CodexAppServerProvider,
       of "text": textInput = capabilitySupported
       of "image": imageInput = capabilitySupported
       else: discard
-  ModelDescriptor(providerId: adapter.id, id: ModelId(id),
+  result = ModelDescriptor(providerId: adapter.id, id: ModelId(id),
     displayName: node{"displayName"}.getStr(id).safeDisplay(512),
     capabilities: ModelCapabilities(textInput: textInput,
       imageInput: imageInput, streaming: capabilitySupported,
       tools: capabilityUnsupported), available: true,
     provenance: provenanceDiscovered)
+  let efforts = node{"supportedReasoningEfforts"}
+  if not efforts.isNil and efforts.kind == JArray:
+    for option in efforts:
+      result.addReasoningEffort(option{"reasoningEffort"}.getStr)
+  let defaultEffort = node{"defaultReasoningEffort"}.getStr
+  if defaultEffort in result.reasoningEfforts:
+    result.defaultReasoningEffort = defaultEffort
 
 proc newCodexAppServerProvider*(id = ProviderId("chatgpt"),
     displayName = "ChatGPT (Codex subscription)", executable = "codex",
@@ -540,11 +595,14 @@ method stream*(adapter: CodexAppServerProvider, request: ProviderRequest,
   var input = newJArray()
   input.add %*{"type": "text", "text": text}
   for item in images.items: input.add item
-  result = connection.send(%*{"method": "turn/start", "id": 3,
-    "params": {"threadId": threadId, "input": input,
+  var turnParams = %*{"threadId": threadId, "input": input,
       "approvalPolicy": "never",
       "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
-      "model": $request.model.id}})
+      "model": $request.model.id}
+  if request.reasoningEffort.len > 0:
+    turnParams["effort"] = %request.reasoningEffort
+  result = connection.send(%*{"method": "turn/start", "id": 3,
+    "params": turnParams})
   if not result.ok: return
   let turn = connection.response(3, getMonoTime() + initDuration(
     milliseconds = adapter.requestTimeoutMs), token)
@@ -570,6 +628,17 @@ method stream*(adapter: CodexAppServerProvider, request: ProviderRequest,
       if not emit(textDelta(params{"delta"}.getStr)): token.cancel()
     of "item/reasoning/summaryTextDelta":
       if not emit(visibleSummaryDelta(params{"delta"}.getStr)):
+        token.cancel()
+    of "thread/tokenUsage/updated":
+      let tokenUsage = params{"tokenUsage"}
+      let last = tokenUsage{"last"}
+      let usage = NormalizedUsage(
+        inputTokens: max(0'i64, last{"inputTokens"}.getBiggestInt),
+        outputTokens: max(0'i64, last{"outputTokens"}.getBiggestInt),
+        cachedTokens: max(0'i64, last{"cachedInputTokens"}.getBiggestInt),
+        totalTokens: max(0'i64, last{"totalTokens"}.getBiggestInt))
+      if not emit(usageEvent(usage,
+          max(0'i64, tokenUsage{"modelContextWindow"}.getBiggestInt))):
         token.cancel()
     of "turn/completed":
       let status = params{"turn"}{"status"}.getStr

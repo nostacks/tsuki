@@ -18,6 +18,8 @@ proc encodeModelCache*(models: openArray[ModelDescriptor]): string =
       "tools": $model.capabilities.tools,
       "contextWindow": model.contextWindow,
       "maxOutputTokens": model.maxOutputTokens,
+      "reasoningEfforts": model.reasoningEfforts,
+      "defaultReasoningEffort": model.defaultReasoningEffort,
       "available": model.available,
       "unavailableReason": model.unavailableReason}
   $(%*{"schemaVersion": 1, "models": values})
@@ -60,6 +62,12 @@ proc decodeModelCache*(source: string): ModelCacheResult =
         available: node{"available"}.getBool(true),
         unavailableReason: node{"unavailableReason"}.getStr.safeDisplay(1024),
         provenance: provenanceCached)
+      let efforts = node{"reasoningEfforts"}
+      if not efforts.isNil and efforts.kind == JArray:
+        for effort in efforts: result.models[^1].addReasoningEffort(effort.getStr)
+      let defaultEffort = node{"defaultReasoningEffort"}.getStr
+      if defaultEffort in result.models[^1].reasoningEfforts:
+        result.models[^1].defaultReasoningEffort = defaultEffort
     result.models.sort(proc (a, b: ModelDescriptor): int =
       result = cmp($a.providerId, $b.providerId)
       if result == 0: result = cmp($a.id, $b.id))

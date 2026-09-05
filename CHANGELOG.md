@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Extracted he3 into its own Nimble package at `packages/he3`. The import
+  path is now `he3` (`he3/agent`, `he3/expert`, `he3/protocols/...`) instead
+  of `tsuki/tui`, its tests and benchmarks live under the package, the root
+  tasks delegate to it, and `doc/he3.md` documents the framework for library
+  users.
+- Hardened the coding agent: a cancel arriving between the queue pop and
+  the first provider call is no longer lost, retries honor `Retry-After`
+  and can no longer overflow the backoff shift, retry and Codex waits block
+  on condition variables instead of polling, the OpenAI-compatible stream
+  reads the usage chunk that follows `finish_reason` (with a two second grace
+  when no `[DONE]` arrives), `read_file` only reports truncation for implicit
+  ranges, session saves fsync before the atomic rename, and the agent shell
+  exits when terminal input reaches end-of-file.
+- Sped up the agent core: `safeDisplay` copies clean UTF-8 without
+  per-rune allocation, bounded reads fill a presized buffer, SSE buffering
+  is linear, Codex pipe output is read in 64 KiB chunks, sessions are
+  encoded without a JSON tree, listing decodes only document headers
+  (`decodeSessionHeader`, `SessionStore.loadHeader`), and unchanged image
+  references are revalidated by size and mtime instead of a header read.
+- Rewrote transcript layout: each streamed message keeps an incremental
+  Markdown state and per-line row cache, so a delta costs its appended text
+  rather than a full reparse (2k-delta stream 627 ms to 92 ms); items cut by
+  the top of the viewport now render their visible rows; cached entries are
+  matched by item identity and a session reset invalidates them.
+- Session picker rows show the local update time instead of epoch
+  milliseconds, and model refresh threads reuse finished slots.
+- API keys added with `/provider` persist in an owner-only `credentials.json`
+  and load on the next start. Key checks and model choices confirm through a
+  transient activity-line toast (`toast`, `AgentChat.toast`,
+  `controllerConfirmed`); a rejected key reopens the editor with the reason.
+- Mouse selection now works on screen cells (`CellSelection`,
+  `selectionText`) instead of whole transcript rows, release copies through
+  OSC 52 and the host's clipboard tool, and the loading shimmer sweeps fully
+  off both ends before wrapping.
+
 - Hardened the he3 runtime: SIGWINCH now wakes a blocked wait through the
   reactor pipe, terminal end-of-file ends `runTui` instead of spinning, the
   fatal-signal restore sequence lives in fixed storage, leaving the terminal

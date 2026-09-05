@@ -1,4 +1,4 @@
-import tsuki/tui
+import he3
 
 proc update(event: Event): Update =
   if event.isQuit: quitTui() else: unchanged()

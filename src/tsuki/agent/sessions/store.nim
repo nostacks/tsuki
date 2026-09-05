@@ -4,20 +4,15 @@ import std/[algorithm, os, sets, strutils, sysrand]
 import ../[boundedio, config, limits, types]
 import schema
 
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
+
 type
   SessionDiagnostic* = object
     path*: string
     message*: string
-
-  SessionHeader* = object
-    id*: SessionId
-    title*: string
-    workspaceRoot*: string
-    updatedAtMs*: int64
-    providerId*: ProviderId
-    modelId*: ModelId
-    interrupted*: bool
-    archived*: bool
 
   SessionListResult* = object
     sessions*: seq[SessionHeader]
@@ -58,8 +53,15 @@ func sessionPath(store: SessionStore, id: SessionId,
     else: store.paths.sessionsDir
   directory / ($id & ".json")
 
+proc syncToDisk(file: File) =
+  ## The rename is only atomic against a crash once the new bytes are stable.
+  when defined(windows):
+    discard flushFileBuffers(Handle(getOsFileHandle(file)))
+  else:
+    discard fsync(cint(getFileHandle(file)))
+
 proc save*(store: SessionStore, session: Session): string =
-  ## Flushes a sibling temporary document before one atomic rename.
+  ## Writes and syncs a sibling temporary document before one atomic rename.
   if not session.id.validSessionId: return "invalid session ID"
   let encoded = session.encodeSession
   if encoded.len > store.limits.maxSessionBytes:
@@ -75,6 +77,7 @@ proc save*(store: SessionStore, session: Session): string =
     try:
       file.write(encoded)
       file.flushFile()
+      file.syncToDisk()
       file.close()
       open = false
       moveFile(temporary, target)
@@ -102,12 +105,23 @@ proc load*(store: SessionStore, id: SessionId,
     result.error = "could not load session: " &
       failure.msg.safeDisplay(1024) & " (" & path & ")"
 
-func header(session: Session): SessionHeader =
-  SessionHeader(id: session.id, title: session.title,
-    workspaceRoot: session.workspaceRoot, updatedAtMs: session.updatedAtMs,
-    providerId: session.providerId, modelId: session.modelId,
-    interrupted: session.lastTurnState == turnInterrupted,
-    archived: session.archived)
+proc loadHeader*(store: SessionStore, id: SessionId,
+    archived = false): SessionHeaderResult =
+  ## Reads one session's listing fields without decoding its messages.
+  if not id.validSessionId:
+    return SessionHeaderResult(error: "invalid session ID")
+  let path = store.sessionPath(id, archived)
+  try:
+    if not fileExists(path):
+      return SessionHeaderResult(error: "session does not exist: " & path)
+    let source = readBoundedRegularFile(path, store.limits.maxSessionBytes)
+    if source.error.len > 0:
+      return SessionHeaderResult(error: source.error & ": " & path)
+    result = decodeSessionHeader(source.data, store.limits)
+    if result.error.len > 0: result.error.add " (" & path & ")"
+  except CatchableError as failure:
+    result.error = "could not load session: " &
+      failure.msg.safeDisplay(1024) & " (" & path & ")"
 
 proc scanDirectory(store: SessionStore, directory: string, archived: bool,
     workspaceRoot: string, seen: var HashSet[string],
@@ -127,21 +141,20 @@ proc scanDirectory(store: SessionStore, directory: string, archived: bool,
         output.diagnostics.add SessionDiagnostic(path: path,
           message: source.error)
         continue
-      let decoded = decodeSession(source.data, store.limits)
+      let decoded = decodeSessionHeader(source.data, store.limits)
       if decoded.error.len > 0:
         output.diagnostics.add SessionDiagnostic(path: path,
           message: decoded.error.safeDisplay(1024))
-      elif splitFile(path).name != $decoded.session.id:
+      elif splitFile(path).name != $decoded.header.id:
         output.diagnostics.add SessionDiagnostic(path: path,
           message: "session ID does not match its filename")
-      elif $decoded.session.id in seen:
+      elif $decoded.header.id in seen:
         output.diagnostics.add SessionDiagnostic(path: path,
           message: "duplicate session ID")
       elif workspaceRoot.len == 0 or
-          normalizedPath(decoded.session.workspaceRoot) ==
-            normalizedPath(workspaceRoot):
-        seen.incl $decoded.session.id
-        var item = decoded.session.header
+          decoded.header.workspaceRoot == normalizedPath(workspaceRoot):
+        seen.incl $decoded.header.id
+        var item = decoded.header
         item.archived = archived
         output.sessions.add item
     except CatchableError as failure:
@@ -151,6 +164,8 @@ proc scanDirectory(store: SessionStore, directory: string, archived: bool,
 proc list*(store: SessionStore, workspaceRoot = "",
     includeArchived = false): SessionListResult =
   ## Rebuilds the index from independent documents; corruption stays local.
+  ## Only document headers are decoded, so the cost is bounded by file
+  ## size, not by transcript structure.
   var seen = initHashSet[string]()
   store.scanDirectory(store.paths.sessionsDir, false, workspaceRoot, seen,
     result)

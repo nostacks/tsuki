@@ -1,7 +1,7 @@
 ## Provider adapter contract, normalized stream events, and registry.
 
-import std/[algorithm, locks, tables]
-import types
+import std/[algorithm, locks, monotimes, tables, times]
+import timedwait, types
 
 type
   ProviderErrorKind* = enum
@@ -38,6 +38,7 @@ type
     text*: string
     toolCall*: ToolCall
     usage*: NormalizedUsage
+    contextLimit*: int64
     rateLimitRemaining*: int64
     rateLimitLimit*: int64
     rateLimitResetAtMs*: int64
@@ -54,14 +55,22 @@ type
     providerId*: ProviderId
     model*: ModelDescriptor
     workspaceRoot*: string
+    reasoningEffort*: string
     systemInstruction*: string
     messages*: seq[Message]
     tools*: seq[ProviderToolDefinition]
     maxOutputTokens*: int
 
+  CancelWaiter* = object
+    ## A lock/condition pair another queue blocks on; cancel wakes it.
+    lock*: ptr Lock
+    cond*: ptr Cond
+
   CancellationToken* = ref object
     lock: Lock
+    changed: Cond
     stopped: bool
+    waiters: seq[CancelWaiter]
 
   ProviderEventProc* = proc (event: ProviderEvent): bool {.closure, gcsafe.}
 
@@ -140,17 +149,55 @@ method logout*(adapter: ProviderAdapter,
 proc initCancellationToken*(): CancellationToken =
   new(result)
   initLock(result.lock)
+  initCond(result.changed)
 
 proc cancel*(token: CancellationToken) {.gcsafe.} =
+  ## Waiters are signalled after the token lock is released, so a waiter may
+  ## hold its own lock while checking `isCancelled` without deadlocking.
   if token.isNil: return
   acquire(token.lock)
   token.stopped = true
+  let waiters = token.waiters
+  broadcast(token.changed)
   release(token.lock)
+  for waiter in waiters:
+    acquire(waiter.lock[])
+    broadcast(waiter.cond[])
+    release(waiter.lock[])
 
 proc isCancelled*(token: CancellationToken): bool {.gcsafe.} =
   if token.isNil: return false
   acquire(token.lock)
   result = token.stopped
+  release(token.lock)
+
+proc waitCancel*(token: CancellationToken, timeoutMs: int): bool {.gcsafe.} =
+  ## Blocks up to `timeoutMs` and returns true once the token is cancelled.
+  if token.isNil: return false
+  let deadline = getMonoTime() + initDuration(milliseconds = max(0, timeoutMs))
+  acquire(token.lock)
+  while not token.stopped:
+    let remaining = (deadline - getMonoTime()).inMilliseconds
+    if remaining <= 0: break
+    discard timedWait(token.changed, token.lock, int(remaining))
+  result = token.stopped
+  release(token.lock)
+
+proc addWaiter*(token: CancellationToken, waiter: CancelWaiter) {.gcsafe.} =
+  ## Registers a queue to wake on cancel. The caller must remove the waiter
+  ## before the lock and condition it points to are destroyed.
+  if token.isNil or waiter.lock.isNil or waiter.cond.isNil: return
+  acquire(token.lock)
+  token.waiters.add waiter
+  release(token.lock)
+
+proc removeWaiter*(token: CancellationToken, waiter: CancelWaiter) {.gcsafe.} =
+  if token.isNil: return
+  acquire(token.lock)
+  for index in countdown(token.waiters.len - 1, 0):
+    if token.waiters[index].lock == waiter.lock and
+        token.waiters[index].cond == waiter.cond:
+      token.waiters.delete(index)
   release(token.lock)
 
 func ok*(failure: ProviderError): bool =
@@ -168,8 +215,8 @@ func visibleSummaryDelta*(text: string): ProviderEvent =
 func toolCallEvent*(call: ToolCall): ProviderEvent =
   ProviderEvent(kind: providerToolCall, toolCall: call)
 
-func usageEvent*(usage: NormalizedUsage): ProviderEvent =
-  ProviderEvent(kind: providerUsage, usage: usage)
+func usageEvent*(usage: NormalizedUsage, contextLimit = 0'i64): ProviderEvent =
+  ProviderEvent(kind: providerUsage, usage: usage, contextLimit: contextLimit)
 
 func rateLimitEvent*(remaining, limit, resetAtMs: int64): ProviderEvent =
   ProviderEvent(kind: providerRateLimitUpdate,
@@ -212,10 +259,11 @@ proc providers*(registry: ProviderRegistry): seq[ProviderAdapter] =
   result.sort(proc (left, right: ProviderAdapter): int =
     cmp($left.id, $right.id))
 
-func classifyHttpError*(status: int, message = ""): ProviderError =
+func classifyHttpError*(status: int, message = "",
+    retryAfterMs = 0'i64): ProviderError =
   ## Maps HTTP outcomes without retaining response headers or credentials.
   let safe = message.safeDisplay(2048)
-  case status
+  result = case status
   of 400:
     ProviderError(kind: providerMalformedResponse,
       message: if safe.len > 0: safe else: "provider rejected the request",
@@ -244,3 +292,5 @@ func classifyHttpError*(status: int, message = ""): ProviderError =
     ProviderError(kind: providerTransport,
       message: if safe.len > 0: safe else: "provider HTTP error " & $status,
       retryable: status >= 500, httpStatus: status)
+  if result.retryable and retryAfterMs > 0:
+    result.retryAfterMs = retryAfterMs

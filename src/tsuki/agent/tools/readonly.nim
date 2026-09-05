@@ -169,8 +169,8 @@ proc readFileTool*(policy: ToolHostPolicy, request: ToolRequest, path: string,
       break
     rows.add row.safeDisplay(policy.limits.maxToolOutputBytes - outputBytes)
     outputBytes += row.len + 1
-  if number > lastWanted or outputBytes < content.len and endLine == 0:
-    result.truncated = result.truncated or number >= lastWanted
+  if endLine == 0 and number > lastWanted:
+    result.truncated = true
   result.requestId = request.id
   result.name = request.name
   result.success = true

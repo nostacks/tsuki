@@ -1,8 +1,11 @@
 # he3 quick start
 
-he3 is the in-repo terminal UI framework that powers the Tsuki coding agent.
-Its public import path is `tsuki/tui`. The framework is kept modular so the
+he3 is the terminal UI framework that powers the Tsuki coding agent. It is
+its own Nimble package in `packages/he3` and its public import path is `he3`. The framework is kept modular so the
 agent's transports, tools, policies, and presentation can evolve independently.
+The [he3 library guide](he3.md) is the complete reference for building your
+own program on the framework, including how to depend on it from another
+project.
 
 The TUI is immediate-mode: your application owns durable state and redraws a
 desired frame only after an event invalidates it. Front/back buffers, terminal
@@ -11,7 +14,7 @@ sequences, and teardown belong to the runtime.
 ## Lifecycle and updates
 
 ```nim
-import tsuki/tui
+import he3
 
 var count = 0
 discard runTui(
@@ -67,14 +70,14 @@ opt-in subprocess formatting; it allowlists SGR styling and turns OSC/other
 commands into inert visible labels.
 
 Optional hyperlinks, clipboard writes, and image metadata live under
-`tsuki/tui/protocols`. They require advertised capabilities, safe metadata,
+`he3/protocols`. They require advertised capabilities, safe metadata,
 size limits, and, where an external effect is involved, an explicit
 application decision. The runtime wraps each frame in DEC synchronized output
 on terminals that advertise it and writes nothing for an unchanged frame.
 
 ## Agent applications
 
-Import `tsuki/tui/agent` for typed thread-safe events, safe streaming Markdown,
+Import `he3/agent` for typed thread-safe events, safe streaming Markdown,
 virtualized transcripts, queued prompts, prompt history/completions,
 code/diff/tool views, foreground/background tools, plans, status, and two-step
 approvals. `AgentChat` owns presentation state, not
@@ -95,7 +98,7 @@ scoped runtime, `counter.nim` shows a centered solid-canvas app, and
 ## Testing and low-level work
 
 `initHeadlessTui` renders semantic cell snapshots without touching a terminal.
-The supported framework-author escape hatch is `tsuki/tui/expert`; ordinary
+The supported framework-author escape hatch is `he3/expert`; ordinary
 applications should not import private modules or manipulate output sinks.
 
 Run `nimble test`, `nimble fuzz`, `nimble docs`, `nimble bench`, and

@@ -1,10 +1,10 @@
 ## Tsuki coding-agent executable host.
 
-import std/[algorithm, locks, os, strutils]
+import std/[algorithm, locks, os, osproc, streams, strutils, times]
 import std/typedthreads
 import tsuki/agent
-import tsuki/tui/agent as agentui
-from tsuki/tui/agent/model import agentError
+import he3/agent as agentui
+from he3/agent/model import agentError
 
 const tsukiVersion* = "0.1.0"
 
@@ -16,13 +16,14 @@ type HostState = object
   sessionKeys: seq[tuple[providerId: ProviderId, key: string]]
   models: seq[ModelDescriptor]
   modelCacheFile: string
+  credentialsFile: string
   discoveryToken: CancellationToken
   modelsLock: Lock
   cacheLock: Lock
   adaptersLock: Lock
   authLock: Lock
   refreshThreads: array[8, Thread[void]]
-  refreshCount: int
+  refreshActive: array[8, bool]
   refreshAdapter: ProviderAdapter
 
 var activeHost: ptr HostState
@@ -66,8 +67,16 @@ proc toolsEnabled(config: TsukiConfig, providerId: ProviderId): bool =
   let provider = config.findProvider(providerId)
   $provider.id != "" and provider.toolsEnabled
 
-proc selectorEntries(config: TsukiConfig,
-    models: openArray[ModelDescriptor]): seq[SelectorEntry] =
+type KeyLookup = proc (providerId: ProviderId): string {.gcsafe.}
+
+proc needsKey(provider: ProviderConfig, sessionKey: KeyLookup): bool =
+  ## True for key-based providers with neither an environment variable nor
+  ## a stored or session key.
+  provider.credentialEnv.len > 0 and provider.resolvedCredential.len == 0 and
+    sessionKey(provider.id).len == 0
+
+proc selectorEntries(config: TsukiConfig, models: openArray[ModelDescriptor],
+    sessionKey: KeyLookup): seq[SelectorEntry] =
   var emitted = 0
   for provider in config.providers:
     if not provider.enabled: continue
@@ -87,11 +96,12 @@ proc selectorEntries(config: TsukiConfig,
         displayName: model.displayName,
         imageInput: capability(model.capabilities.imageInput),
         tools: capability(model.capabilities.tools),
+        reasoningEfforts: model.reasoningEfforts,
+        defaultReasoningEffort: model.defaultReasoningEffort,
         available: model.available, reason: model.unavailableReason)
     if not found:
-      let reason = if provider.credentialEnv.len > 0 and
-          provider.resolvedCredential.len == 0:
-        "Set " & provider.credentialEnv & " or use /provider to add a key."
+      let reason = if provider.needsKey(sessionKey):
+        "Use /provider to add a key, or set " & provider.credentialEnv & "."
       elif provider.kind == "codex_app_server":
         "Use /provider to sign in, or wait for ChatGPT model discovery."
       else:
@@ -102,10 +112,9 @@ proc selectorEntries(config: TsukiConfig,
         reason: reason)
 
 proc authEntries(config: TsukiConfig,
-    sessionKey: proc (providerId: ProviderId): string): 
-    seq[agentui.ProviderAuthEntry] =
-  ## Projects provider auth state for the sign-in dialog. Session keys count
-  ## as present; Codex sign-in state is owned by the Codex CLI.
+    sessionKey: KeyLookup): seq[agentui.ProviderAuthEntry] =
+  ## Projects provider auth state for the sign-in dialog. Stored and session
+  ## keys count as present; Codex sign-in state is owned by the Codex CLI.
   for provider in config.providers:
     if not provider.enabled: continue
     if provider.kind == "codex_app_server":
@@ -124,7 +133,7 @@ proc authEntries(config: TsukiConfig,
           else: agentui.providerAuthMissing,
         credentialEnv: provider.credentialEnv,
         detail: if provider.credentialEnv.len > 0:
-          "env " & provider.credentialEnv & " or a session key" else: "")
+          "env " & provider.credentialEnv & " or a stored key" else: "")
 
 proc mergeModels(models: var seq[ModelDescriptor],
     incoming: openArray[ModelDescriptor]) =
@@ -226,23 +235,71 @@ proc setSessionKey(host: ptr HostState, providerId: ProviderId, key: string) =
   if not replaced: host[].sessionKeys.add (providerId, key)
   release(host[].authLock)
 
-proc publishAuthEntries(host: ptr HostState) =
-  proc lookup(providerId: ProviderId): string {.gcsafe.} =
+proc keyLookup(host: ptr HostState): KeyLookup =
+  result = proc (providerId: ProviderId): string {.gcsafe.} =
     host.sessionKey(providerId)
+
+proc hostSelectorEntries(host: ptr HostState,
+    models: openArray[ModelDescriptor]): seq[SelectorEntry] =
+  host[].config.selectorEntries(models, host.keyLookup)
+
+proc publishAuthEntries(host: ptr HostState) =
   discard host[].chat.post agentui.authUpdated(
-    host[].config.authEntries(lookup))
+    host[].config.authEntries(host.keyLookup))
+
+proc persistKeys(host: ptr HostState): string =
+  ## Writes every session key to the owner-only credentials file.
+  var entries: seq[StoredCredential]
+  acquire(host[].authLock)
+  for entry in host[].sessionKeys:
+    entries.add StoredCredential(providerId: entry.providerId,
+      apiKey: entry.key)
+  release(host[].authLock)
+  saveCredentials(host[].credentialsFile, entries)
+
+proc copyToSystemClipboard(text: string): string =
+  ## Pipes text to the platform clipboard tool. Returns "" on success or a
+  ## short reason when no tool accepted it.
+  var candidates: seq[tuple[command: string, args: seq[string]]]
+  when defined(macosx):
+    candidates.add ("pbcopy", @[])
+  elif defined(windows):
+    candidates.add ("clip", @[])
+  else:
+    if getEnv("WAYLAND_DISPLAY").len > 0:
+      candidates.add ("wl-copy", @[])
+    candidates.add ("xclip", @["-selection", "clipboard"])
+    candidates.add ("xsel", @["--clipboard", "--input"])
+  for candidate in candidates:
+    if findExe(candidate.command).len == 0: continue
+    try:
+      let process = startProcess(candidate.command, args = candidate.args,
+        options = {poUsePath, poStdErrToStdOut})
+      try:
+        process.inputStream.write(text)
+        process.inputStream.close()
+        let code = process.waitForExit(2_000)
+        if code == 0: return ""
+        result = candidate.command & " exited with status " & $code
+      finally:
+        process.close()
+    except CatchableError as failure:
+      result = failure.msg.safeDisplay(256)
+  if result.len == 0: result = "no clipboard tool was found"
 
 proc refreshAdapterMain() {.thread.} =
   ## Refreshes one adapter's models after its credential changed. The target
-  ## travels through the shared host slot; no GC'd value crosses the thread
-  ## boundary as a thread argument.
+  ## travels through the shared host slot under the adapters lock; no GC'd
+  ## value crosses the thread boundary as a thread argument.
+  acquire(activeHost[].adaptersLock)
   let adapter = activeHost[].refreshAdapter
+  activeHost[].refreshAdapter = nil
+  release(activeHost[].adaptersLock)
   if adapter.isNil: return
   let discovered = adapter.refreshModels(activeHost[].discoveryToken)
   if discovered.error.ok:
     discard activeHost.replaceProviderModels(adapter.id, discovered.models)
-    var entries = activeHost[].config.selectorEntries(
-      activeHost.modelSnapshot)
+    var entries = activeHost.hostSelectorEntries(activeHost.modelSnapshot)
     discard activeHost[].chat.post selectorUpdated(entries)
     let cacheError = activeHost.saveCatalog()
     if cacheError.len > 0:
@@ -252,32 +309,43 @@ proc refreshAdapterMain() {.thread.} =
       "Models for " & adapter.displayName &
       " could not be refreshed: " & discovered.error.message)
 
+proc freeRefreshSlot(host: ptr HostState): int =
+  ## Spawn, reap, and join all happen on the UI thread, so no lock is needed.
+  for index in 0 ..< host[].refreshThreads.len:
+    if host[].refreshActive[index] and not running(
+        host[].refreshThreads[index]):
+      joinThread(host[].refreshThreads[index])
+      host[].refreshActive[index] = false
+    if not host[].refreshActive[index]: return index
+  -1
+
 proc spawnRefresh(host: ptr HostState, adapter: ProviderAdapter) =
   ## Starts one bounded model refresh without blocking the UI thread. The
   ## thread handle must live at a stable address, so the thread is created
   ## directly into its shared-host slot; slots are joined at exit.
-  acquire(host[].adaptersLock)
-  if host[].refreshCount >= host[].refreshThreads.len:
-    release(host[].adaptersLock)
-    discard activeHost[].chat.post notice("model-refresh-busy",
+  let slot = host.freeRefreshSlot()
+  if slot < 0:
+    discard host[].chat.post notice("model-refresh-busy",
       "Too many model refreshes are already running.")
     return
+  acquire(host[].adaptersLock)
   host[].refreshAdapter = adapter
-  let slot = host[].refreshCount
+  release(host[].adaptersLock)
   try:
     createThread(host[].refreshThreads[slot], refreshAdapterMain)
   except CatchableError as failure:
+    acquire(host[].adaptersLock)
+    host[].refreshAdapter = nil
     release(host[].adaptersLock)
-    discard activeHost[].chat.post notice("model-refresh-error", failure.msg)
+    discard host[].chat.post notice("model-refresh-error", failure.msg)
     return
-  inc host[].refreshCount
-  release(host[].adaptersLock)
+  host[].refreshActive[slot] = true
 
 proc joinRefreshes(host: ptr HostState) =
-  ## Spawn and join both happen on the UI thread, so no lock is required.
-  for index in 0 ..< host[].refreshCount:
-    joinThread(host[].refreshThreads[index])
-  host[].refreshCount = 0
+  for index in 0 ..< host[].refreshThreads.len:
+    if host[].refreshActive[index]:
+      joinThread(host[].refreshThreads[index])
+      host[].refreshActive[index] = false
 
 proc discoveryMain() {.thread.} =
   var refreshed = false
@@ -290,8 +358,7 @@ proc discoveryMain() {.thread.} =
       discard activeHost.replaceProviderModels(adapter.id,
         discovered.models)
       refreshed = true
-      var entries = activeHost[].config.selectorEntries(
-        activeHost.modelSnapshot)
+      var entries = activeHost.hostSelectorEntries(activeHost.modelSnapshot)
       entries.add failures
       discard activeHost[].chat.post selectorUpdated(entries)
     elif discovered.error.kind notin {providerCancelled,
@@ -300,8 +367,7 @@ proc discoveryMain() {.thread.} =
         providerName: adapter.displayName, displayName: "Discovery unavailable",
         imageInput: selectorUnknown, tools: selectorUnknown, available: false,
         reason: discovered.error.message)
-      var entries = activeHost[].config.selectorEntries(
-        activeHost.modelSnapshot)
+      var entries = activeHost.hostSelectorEntries(activeHost.modelSnapshot)
       entries.add failures
       discard activeHost[].chat.post selectorUpdated(entries)
   if refreshed and not activeHost[].discoveryToken.isCancelled:
@@ -309,10 +375,18 @@ proc discoveryMain() {.thread.} =
     if cacheError.len > 0:
       discard activeHost[].chat.post notice("model-cache-error", cacheError)
 
+proc updatedLabel(updatedAtMs: int64): string =
+  if updatedAtMs <= 0: return ""
+  try:
+    fromUnix(updatedAtMs div 1_000).local.format("yyyy-MM-dd HH:mm")
+  except CatchableError:
+    ""
+
 proc sessionEntries(listed: SessionListResult): seq[SessionPickerEntry] =
   for session in listed.sessions:
     result.add SessionPickerEntry(id: $session.id, title: session.title,
-      workspace: session.workspaceRoot, updatedLabel: $session.updatedAtMs,
+      workspace: session.workspaceRoot,
+      updatedLabel: session.updatedAtMs.updatedLabel,
       providerModel: $session.providerId & "/" & $session.modelId,
       interrupted: session.interrupted)
   for diagnostic in listed.diagnostics:
@@ -387,10 +461,14 @@ proc runTsuki*(arguments: seq[string]): int =
     if $models.findModel(cachedModel.providerId, cachedModel.id).id == "":
       models.add cachedModel
   let providerConfig = config.findProvider(session.providerId)
+  let storedCredentials = loadCredentials(defaults.credentialsFile)
+  let storedKey: KeyLookup = proc (providerId: ProviderId): string {.gcsafe.} =
+    for entry in storedCredentials.entries:
+      if entry.providerId == providerId: return entry.apiKey
   var adapters: seq[ProviderAdapter]
   for configured in config.providers:
     if not configured.enabled: continue
-    let built = makeAdapter(configured)
+    let built = makeAdapter(configured, storedKey(configured.id))
     if not built.isNil: adapters.add built
   var adapter = adapters.findAdapter(session.providerId)
   let configuredAdapter = not adapter.isNil
@@ -430,6 +508,9 @@ proc runTsuki*(arguments: seq[string]): int =
     chat.apply agentError("session-error", startupError)
   if initialSaveError.len > 0:
     chat.apply agentError("session-save-error", initialSaveError)
+  if storedCredentials.error.len > 0:
+    chat.apply agentError("credentials-error", storedCredentials.error &
+      "\nCredentials: " & defaults.credentialsFile)
   for diagnostic in listed.diagnostics:
     chat.apply notice("session-corrupt:" & diagnostic.path,
       "Skipped a corrupt session: " & diagnostic.path & "\n" &
@@ -438,11 +519,10 @@ proc runTsuki*(arguments: seq[string]): int =
     chat.apply notice("first-run-provider",
       "No configured provider matches '" & $session.providerId & "'.\n" &
       "Configuration: " & loadedConfig.path)
-  elif providerConfig.credentialEnv.len > 0 and
-      providerConfig.resolvedCredential.len == 0:
+  elif providerConfig.needsKey(storedKey):
     chat.apply notice("first-run-credential",
-      "Set " & providerConfig.credentialEnv & ", or use /provider to add " &
-      "a key for " & providerConfig.displayName & ".\n" &
+      "Use /provider to add a key for " & providerConfig.displayName &
+      ", or set " & providerConfig.credentialEnv & ".\n" &
       "Configuration: " & loadedConfig.path)
   elif not adapterValidation.ok:
     chat.apply agentError("provider-config", adapterValidation.message)
@@ -461,29 +541,29 @@ proc runTsuki*(arguments: seq[string]): int =
       let current = activeHost.replaceProviderModels(event.providerId,
         event.models)
       discard chat.post agentui.selectorUpdated(
-        activeHost[].config.selectorEntries(current))
+        activeHost.hostSelectorEntries(current))
       let cacheError = activeHost.saveCatalog()
       if cacheError.len > 0:
         discard chat.post notice("model-cache-error", cacheError)
   let controller = initAgentController(session, store, adapter, selected,
     controllerSink,
     toolsEnabled = config.toolsEnabled(session.providerId))
-  let offline = (providerConfig.credentialEnv.len > 0 and
-    providerConfig.resolvedCredential.len == 0) or
+  let offline = providerConfig.needsKey(storedKey) or
     not adapterValidation.ok
-  let startupAuth = config.authEntries(
-    proc (providerId: ProviderId): string {.gcsafe.} = "")
-  var availableSelectors = config.selectorEntries(models)
+  let startupAuth = config.authEntries(storedKey)
+  var availableSelectors = config.selectorEntries(models, storedKey)
   chat.apply agentui.selectorUpdated(availableSelectors)
   chat.apply agentui.authUpdated(startupAuth)
   chat.apply agentui.sessionsUpdated(currentListed.sessionEntries)
   chat.apply agentui.statusUpdated(agentui.AgentViewStatus(
     provider: $session.providerId, model: $session.modelId, mode: "agent",
     message: if offline: "offline" else: "ready", offline: offline,
-    contextLimit: selected.contextWindow))
+    contextLimit: selected.contextWindow, directory: workspace,
+    reasoningEffort: session.reasoningEffort))
   let options = agentTuiOptions(status = AgentStatus(
     provider: $session.providerId, model: $session.modelId, mode: "agent",
-    message: if offline: "offline" else: "ready", offline: offline),
+    message: if offline: "offline" else: "ready", offline: offline,
+    directory: workspace, reasoningEffort: session.reasoningEffort),
     selectorEntries = availableSelectors,
     authEntries = startupAuth,
     sessionEntries = currentListed.sessionEntries)
@@ -495,6 +575,9 @@ proc runTsuki*(arguments: seq[string]): int =
   activeHost[].adapters = adapters
   activeHost[].models = models
   activeHost[].modelCacheFile = defaults.modelCacheFile
+  activeHost[].credentialsFile = defaults.credentialsFile
+  for entry in storedCredentials.entries:
+    activeHost[].sessionKeys.add (entry.providerId, entry.apiKey)
   activeHost[].discoveryToken = initCancellationToken()
   initLock(activeHost[].modelsLock)
   initLock(activeHost[].cacheLock)
@@ -524,22 +607,22 @@ proc runTsuki*(arguments: seq[string]): int =
       discard controller.post ControllerCommand(kind: commandNewSession)
     of aaResumeSession:
       let targetId = SessionId(action.argument.safeId())
-      let target = store.load(targetId)
+      let target = store.loadHeader(targetId)
       var targetModel: ModelDescriptor
       var targetAdapter: ProviderAdapter
       var targetTools = false
       if target.error.len == 0:
         targetAdapter = activeHost.hostAdapters.findAdapter(
-          target.session.providerId)
+          target.header.providerId)
         targetModel = activeHost.modelSnapshot.findModel(
-          target.session.providerId,
-          target.session.modelId)
+          target.header.providerId,
+          target.header.modelId)
         if $targetModel.id == "" and not targetAdapter.isNil:
-          targetModel = ModelDescriptor(providerId: target.session.providerId,
-            id: target.session.modelId, displayName: $target.session.modelId,
+          targetModel = ModelDescriptor(providerId: target.header.providerId,
+            id: target.header.modelId, displayName: $target.header.modelId,
             capabilities: unknownCapabilities(), available: true,
             provenance: provenanceCached)
-        targetTools = config.toolsEnabled(target.session.providerId)
+        targetTools = config.toolsEnabled(target.header.providerId)
       discard controller.post ControllerCommand(kind: commandSwitchSession,
         sessionId: targetId, model: targetModel, adapter: targetAdapter,
         toolsEnabled: targetTools, toolsConfigured: target.error.len == 0)
@@ -565,6 +648,7 @@ proc runTsuki*(arguments: seq[string]): int =
         if $model.id != "" and not selectedAdapter.isNil:
           discard controller.post ControllerCommand(kind: commandSelectModel,
             model: model, adapter: selectedAdapter,
+            reasoningEffort: action.reasoningEffort,
             toolsEnabled: config.toolsEnabled(providerId),
             toolsConfigured: true)
     of aaApiKey:
@@ -575,25 +659,35 @@ proc runTsuki*(arguments: seq[string]): int =
         let key = parts[1].strip()
         let provider = activeHost[].config.findProvider(providerId)
         if $provider.id == "":
-          discard chat.post notice("provider-unknown",
-            "No configured provider matches that ID.")
+          discard chat.post toast("api-key",
+            "No configured provider matches that ID.", success = false)
         elif key.len == 0:
-          discard chat.post notice("api-key-empty",
-            "The API key was empty; nothing was stored.")
+          discard chat.post toast("api-key",
+            "The API key was empty. Nothing was stored.", success = false)
         elif provider.kind notin ["openai_compatible", "openrouter"]:
-          discard chat.post notice("api-key-unsupported",
+          discard chat.post toast("api-key",
             provider.displayName & " signs in through its own flow instead " &
-            "of an API key.")
+            "of an API key.", success = false)
         else:
           let keyed = makeAdapter(provider, key)
           let validation = keyed.validate()
           if not validation.ok:
-            discard chat.post agentError("api-key-invalid", validation.message)
+            discard chat.post toast("api-key", validation.message,
+              success = false)
           else:
             activeHost.upsertAdapter(keyed)
             activeHost.setSessionKey(providerId, key)
+            let saveError = activeHost.persistKeys()
             activeHost.publishAuthEntries()
             activeHost.spawnRefresh(keyed)
+            var confirmation = if saveError.len == 0:
+              "API key saved for " & provider.displayName
+            else:
+              "API key added for " & provider.displayName &
+                " for this session only"
+            if saveError.len > 0:
+              discard chat.post agentError("credentials-save", saveError &
+                "\nCredentials: " & activeHost[].credentialsFile)
             if $session.providerId == $providerId and $session.modelId != "":
               var model = activeHost.modelSnapshot.findModel(providerId,
                 session.modelId)
@@ -607,9 +701,8 @@ proc runTsuki*(arguments: seq[string]): int =
                 toolsEnabled: config.toolsEnabled(providerId),
                 toolsConfigured: true)
             else:
-              discard chat.post notice("api-key-stored",
-                "API key stored for " & provider.displayName &
-                ". Choose a model with /model.")
+              confirmation.add ". Choose a model with /model."
+            discard chat.post toast("api-key", confirmation)
     of aaAttach:
       discard controller.post ControllerCommand(kind: commandAttach,
         text: parseAttachArgument("/attach " & action.argument))
@@ -645,7 +738,14 @@ proc runTsuki*(arguments: seq[string]): int =
     of aaApproval:
       discard
     of aaCopy:
-      discard
+      let failure = copyToSystemClipboard(action.text)
+      if failure.len == 0 or action.terminalCopied:
+        let lines = action.text.count('\n') + 1
+        discard chat.post toast("copy", "Copied " & $lines &
+          (if lines == 1: " line" else: " lines"))
+      else:
+        discard chat.post toast("copy", "Copy failed: " & failure,
+          success = false)
 
   let tuiResult = runAgentTui(chat, handleAction, options)
   activeHost[].discoveryToken.cancel()

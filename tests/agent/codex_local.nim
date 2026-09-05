@@ -26,7 +26,10 @@ proc fakeAppServer() =
       if request{"params"}{"cursor"}.getStr.len == 0:
         reply(%*{"id": id, "result": {"data": [
           {"id": "codex-one", "displayName": "Codex One",
-            "inputModalities": ["text", "image"], "isDefault": true},
+            "inputModalities": ["text", "image"], "isDefault": true,
+            "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [{"reasoningEffort": "low"},
+              {"reasoningEffort": "medium"}, {"reasoningEffort": "high"}]},
           {"id": "codex-two", "displayName": "Codex Two",
             "inputModalities": ["text"]}], "nextCursor": "page-two"}})
       else:
@@ -59,6 +62,10 @@ proc fakeAppServer() =
           "result": {"thread": {"id": "thr-fixture"}}})
     of "turn/start":
       let params = request{"params"}
+      if params{"effort"}.getStr != "high":
+        reply(%*{"id": id, "error": {"code": -32602,
+          "message": "missing selected reasoning effort"}})
+        continue
       if params{"approvalPolicy"}.getStr != "never" or
           params{"sandboxPolicy"}{"type"}.getStr != "readOnly" or
           params{"sandboxPolicy"}{"networkAccess"}.getBool(true):
@@ -73,6 +80,11 @@ proc fakeAppServer() =
       reply(%*{"method": "item/agentMessage/delta", "params": {
         "threadId": "thr-fixture", "turnId": "turn-fixture",
         "delta": "hello from Codex"}})
+      reply(%*{"method": "thread/tokenUsage/updated", "params": {
+        "threadId": "thr-fixture", "turnId": "turn-fixture",
+        "tokenUsage": {"modelContextWindow": 128000,
+          "last": {"inputTokens": 2000, "outputTokens": 100,
+            "cachedInputTokens": 500, "totalTokens": 2100}}}})
       reply(%*{"method": "turn/completed", "params": {
         "threadId": "thr-fixture", "turn": {
           "id": "turn-fixture", "status": "completed", "error": nil}}})
@@ -97,6 +109,8 @@ proc runTests() =
           capabilitySupported
         check discovered.models[0].capabilities.tools ==
           capabilityUnsupported
+        check discovered.models[0].reasoningEfforts == @["low", "medium", "high"]
+        check discovered.models[0].defaultReasoningEffort == "medium"
 
     test "delegates ChatGPT device login without receiving credentials":
       var url, code: string
@@ -121,16 +135,22 @@ proc runTests() =
         capabilities: supportedCapabilities(image = true), available: true,
         provenance: provenanceDiscovered)
       let request = ProviderRequest(providerId: adapter.id, model: model,
+        reasoningEffort: "high",
         workspaceRoot: getCurrentDir(),
         messages: @[Message(role: messageUser,
           parts: @[textPart("hello")], status: messageComplete)])
       var summary, answer: string
+      var usage: NormalizedUsage
+      var contextLimit: int64
       var completed = false
       let failure = adapter.stream(request, initCancellationToken(),
         proc (event: ProviderEvent): bool {.gcsafe.} =
         case event.kind
         of providerVisibleSummaryDelta: summary.add event.text
         of providerTextDelta: answer.add event.text
+        of providerUsage:
+          usage = event.usage
+          contextLimit = event.contextLimit
         of providerCompleted: completed = true
         else: discard
         true)
@@ -138,6 +158,8 @@ proc runTests() =
       check summary == "checking "
       check answer == "hello from Codex"
       check completed
+      check usage.inputTokens == 2000 and usage.totalTokens == 2100
+      check contextLimit == 128000
 
     test "logs out through the managed account endpoint":
       check adapter.logout(initCancellationToken()).ok

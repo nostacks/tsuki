@@ -40,13 +40,13 @@ Terminal, cmd.exe conhost.
 | 8 | Global quit | Ctrl-Q exits immediately, including while approval is pending |
 | 9 | Wheel scroll | Wheel scrolls the transcript from any focus; composer, divider, and status stay fixed |
 | 10 | Autoscroll | New lines while scrolled to bottom keep the view pinned |
-| 11 | Slash commands | `/help` lists commands, `/clear` explains durable-history semantics, `/new` starts fresh, `/quit` exits, unknown commands report quietly |
+| 11 | Slash commands | `/help` lists commands, `/clear` and `/new` start fresh while retaining the previous saved session, `/quit` exits, unknown commands report quietly |
 | 12 | Slash completion | Typing `/` opens the recommended-command popover; arrows move, Tab/Enter complete, and Escape closes it without quitting |
 | 13 | Wide chars/emoji | Paste CJK and emoji; cursor and wrap stay correct |
 | 14 | Multiline paste | Bracketed paste lands in the draft; the composer grows for multiline drafts |
 | 15 | Resize | Resize from 40x12 through 120x30; bottom chrome stays anchored, no artifacts or tearing |
 | 16 | Idle behavior | After a completed turn the process performs zero wakeups (no spinner timer while idle) |
-| 17 | Text selection | Mouse press and drag highlights transcript rows; Ctrl-C copies them and clears the highlight |
+| 17 | Text selection | Mouse press and drag highlights screen cells; release copies them and reports "Copied N lines"; a plain click clears the highlight |
 | 18 | Activity shimmer | The spinner label shows a bright wave traveling through it, driven by the spinner timer with no extra wakeups |
 | 19 | Prompt queue | Submit two prompts quickly; the activity line shows `1 prompt queued`, then dispatches it after the active turn finishes |
 | 20 | Background task | Workspace indexing streams through a `background · Index workspace` tool without taking over foreground activity |

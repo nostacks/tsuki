@@ -1,13 +1,78 @@
-import std/[os, strutils, unittest]
+import std/[json, os, strutils, unicode, unittest]
 import tsuki/agent
-import tsuki/tui/agent as agentui
-import tsuki/tui/terminal
-import tsuki/tui/protocols/image
+import he3/agent as agentui
+import he3/terminal
+import he3/protocols/image
 
 proc temporaryRoot(label: string): string =
   getTempDir() / ("tsuki-phase1-" & label & "-" & $generateSessionId())
 
 suite "phase 1 product core":
+  test "reasoning metadata survives configuration and caching":
+    let configured = parseConfig("""{"schemaVersion":1,"providers":[{
+      "id":"fixture","kind":"openai_compatible","displayName":"Fixture",
+      "baseUrl":"https://example.com/v1","models":[{"id":"reasoner",
+      "reasoningEfforts":["low","high"],"defaultReasoningEffort":"low"}]}]}""")
+    check configured.error.len == 0
+    if configured.error.len == 0:
+      let model = configured.config.providers[0].models[0]
+      check model.reasoningEfforts == @["low", "high"]
+      let cached = decodeModelCache(encodeModelCache(@[model]))
+      check cached.error.len == 0
+      check cached.models[0].reasoningEfforts == model.reasoningEfforts
+      check cached.models[0].defaultReasoningEffort == "low"
+
+  test "reasoning selection persists and reaches requests without leaking across models":
+    let root = temporaryRoot("reasoning")
+    defer:
+      if dirExists(root): removeDir(root)
+    createDir(root)
+    let store = initSessionStore(platformPaths(home = root,
+        dataOverride = root / "data"))
+    let provider = newMockProvider(script = @[mockText("answer"),
+      mockDone(NormalizedUsage(inputTokens: 100, outputTokens: 20,
+          totalTokens: 120)),
+      MockStep(kind: mockComplete)])
+    var model = provider.models[0]
+    model.reasoningEfforts = @["low", "high"]
+    let session = newSession(SessionId("s-reasoning"), root, provider.id, model.id)
+    let chat = agentui.initAgentChat()
+    defer: chat.close()
+    let controller = initAgentController(session, store, provider, model,
+      chat.tuiEventSink())
+    defer: controller.commands.close()
+    check controller.post ControllerCommand(kind: commandSelectModel,
+      model: model,
+      reasoningEffort: "high")
+    check controller.post ControllerCommand(kind: commandSubmit, text: "reason")
+    check controller.post ControllerCommand(kind: commandSelectModel,
+      model: model,
+      reasoningEffort: "unsupported")
+    check controller.post ControllerCommand(kind: commandSave)
+    check controller.post ControllerCommand(kind: commandShutdown)
+    controller.run()
+    discard chat.drain()
+    check provider.requests.len == 1
+    if provider.requests.len == 1: check provider.requests[0].reasoningEffort == "high"
+    let saved = store.load(session.id)
+    check saved.error.len == 0 and saved.session.reasoningEffort == "high"
+    check chat.status.directory == root and chat.status.reasoningEffort == "high"
+    check chat.status.contextUsed == 120
+    check parseJson(encodeSession(saved.session)){"reasoningEffort"}.getStr == "high"
+    let resumed = initAgentController(saved.session, store, provider, model,
+      chat.tuiEventSink())
+    defer: resumed.commands.close()
+    var plain = model
+    plain.id = ModelId("plain")
+    plain.reasoningEfforts = @[]
+    check resumed.post ControllerCommand(kind: commandSelectModel, model: plain)
+    check resumed.post ControllerCommand(kind: commandSubmit, text: "plain")
+    check resumed.post ControllerCommand(kind: commandShutdown)
+    resumed.run()
+    check provider.requests.len == 2
+    if provider.requests.len == 2: check provider.requests[
+        1].reasoningEffort.len == 0
+
   test "capabilities, identifiers, and display values stay explicit":
     let caps = unknownCapabilities()
     check caps.imageInput == capabilityUnknown
@@ -16,6 +81,55 @@ suite "phase 1 product core":
     let cleaned = safeDisplay("safe\e]52;owned\a")
     check '\e' notin cleaned
     check '\a' notin cleaned
+
+  test "safe display strips bidi, C1, and controls on the fast path":
+    let mixed = "ok‮hidden⁦xy\x01z\x7Ftab\tnl\n日本"
+    let shown = safeDisplay(mixed, 4096)
+    check "‮" notin shown and "⁦" notin shown
+    check "" notin shown and '\x01' notin shown and '\x7F' notin shown
+    check shown.count("�") == 5
+    check shown.endsWith("tab\tnl\n日本")
+    check safeDisplay("日本語", 4) == "日"
+    check safeDisplay("plain", 0) == ""
+    let repaired = safeDisplay("bad\xffbyte", 64)
+    check validateUtf8(repaired) < 0 and '\xff' notin repaired
+
+  test "session headers decode without materializing messages":
+    var session = newSession(SessionId("s-header"), "/workspace",
+      ProviderId("mock"), ModelId("model"), 10)
+    session.title = "Header only"
+    session.updatedAtMs = 77
+    session.lastTurnState = turnStreaming
+    for index in 0 ..< 50:
+      session.messages.add Message(id: MessageId("m-" & $index),
+        turnId: TurnId("t"), role: messageAssistant,
+        parts: @[textPart(repeat("{[\"]}", 40))], status: messageComplete)
+    let encoded = session.encodeSession
+    let header = decodeSessionHeader(encoded)
+    check header.error.len == 0
+    check header.header.id == session.id
+    check header.header.title == "Header only"
+    check header.header.updatedAtMs == 77
+    check header.header.providerId == ProviderId("mock")
+    check header.header.modelId == ModelId("model")
+    check header.header.interrupted
+    check not header.header.archived
+    check decodeSession(encoded).error.len == 0
+    check decodeSessionHeader("""{"schemaVersion":9,"id":"x"}""")
+      .futureVersion
+    check decodeSessionHeader("{").error.len > 0
+    check decodeSessionHeader("""{"schemaVersion":1,"id":"s"}""")
+      .error.len > 0
+    check decodeSessionHeader("""{"schemaVersion":1,"id":"s",
+      "title":"t","workspaceRoot":"relative","messages":[]}""")
+      .error.len > 0
+
+  test "cancellation tokens wake bounded waits":
+    let token = initCancellationToken()
+    check not token.waitCancel(20)
+    token.cancel()
+    check token.waitCancel(5_000)
+    check token.isCancelled
 
   test "dynamic picker data and staged cards stay sanitized":
     let chat = agentui.initAgentChat()
@@ -86,6 +200,32 @@ suite "phase 1 product core":
       check paths.configFile == "/cfg/tsuki/config.json"
       check paths.sessionsDir == "/data/tsuki/sessions"
       check paths.modelCacheFile == "/cache/tsuki/models.json"
+      check paths.credentialsFile == "/data/tsuki/credentials.json"
+
+  test "stored credentials round trip with owner-only permissions":
+    let root = getTempDir() / ("tsuki-credentials-" & $generateSessionId())
+    defer:
+      if dirExists(root): removeDir(root)
+    let path = root / "nested" / "credentials.json"
+    check loadCredentials(path).entries.len == 0 and
+      loadCredentials(path).error.len == 0
+    let entries = @[
+      StoredCredential(providerId: ProviderId("openrouter"),
+        apiKey: "sk-or-1234"),
+      StoredCredential(providerId: ProviderId(""), apiKey: "dropped"),
+      StoredCredential(providerId: ProviderId("openai"), apiKey: "")]
+    check saveCredentials(path, entries) == ""
+    when defined(posix):
+      check getFilePermissions(path) * {fpGroupRead, fpGroupWrite,
+        fpOthersRead, fpOthersWrite} == {}
+    let loaded = loadCredentials(path)
+    check loaded.error.len == 0 and loaded.entries.len == 1 and
+      $loaded.entries[0].providerId == "openrouter" and
+      loaded.entries[0].apiKey == "sk-or-1234"
+    check decodeCredentials("{\"schemaVersion\":2}").error.len > 0
+    check decodeCredentials("{\"schemaVersion\":1,\"providers\":[]}")
+      .error.len > 0
+    check decodeCredentials("not json").error.len > 0
 
   test "SSE parsing survives every network chunk boundary":
     let source = ": keepalive\r\ndata: {\"x\":\"😀\"}\r\n\r\n" &
@@ -214,6 +354,16 @@ suite "phase 1 product core":
       argumentsJson: """{"path":"src/one.nim","extra":true}"""))
     check not extra.success
     check extra.errorCode == toolInvalidArguments
+    let ranged = policy.execute(ToolRequest(id: ToolCallId("c-range"),
+      name: "read_file",
+      argumentsJson: """{"path":"src/one.nim","startLine":1,"endLine":1}"""))
+    check ranged.success and not ranged.truncated
+    check ranged.content == "1\tline one"
+    var tight = policy
+    tight.limits.maxReadLines = 1
+    let capped = tight.execute(ToolRequest(id: ToolCallId("c-cap"),
+      name: "read_file", argumentsJson: """{"path":"src/one.nim"}"""))
+    check capped.success and capped.truncated
     when not defined(windows):
       writeFile(outside / "outside.txt", "not workspace data")
       createSymlink(outside, root / "linked")
@@ -308,6 +458,50 @@ suite "phase 1 product core":
     if loaded.session.messages.len == 2:
       check loaded.session.messages[1].messageText == "hello world"
       check loaded.session.messages[1].status == messageComplete
+
+  test "clear resets the transcript and context while preserving saved history":
+    let root = temporaryRoot("clear")
+    defer:
+      if dirExists(root): removeDir(root)
+    createDir(root)
+    let store = initSessionStore(platformPaths(home = root,
+      dataOverride = root / "data"))
+    let provider = newMockProvider()
+    let session = newSession(SessionId("s-clear"), root,
+      provider.id, provider.models[0].id, 1)
+    let chat = agentui.initAgentChat(sessionId = $session.id)
+    defer: chat.close()
+    var state = agentui.initAgentUiState()
+    let controller = initAgentController(session, store, provider,
+      provider.models[0], chat.tuiEventSink())
+    defer: controller.commands.close()
+    check controller.post ControllerCommand(kind: commandSubmit,
+      text: "old conversation")
+    let cleared = agentui.runShellCommand(chat, state, "/clear")
+    check cleared.effect == agentui.seHostAction
+    check cleared.actionKind == agentui.aaNewSession
+    if cleared.effect == agentui.seHostAction and
+        cleared.actionKind == agentui.aaNewSession:
+      check controller.post ControllerCommand(kind: commandNewSession)
+    check controller.post ControllerCommand(kind: commandSubmit,
+      text: "fresh conversation")
+    check controller.post ControllerCommand(kind: commandShutdown)
+    controller.run()
+    discard chat.drain()
+    check chat.sessionId != $session.id
+    check chat.items.len == 2
+    for item in chat.items:
+      check "old conversation" notin item.content
+    check provider.requests.len == 2
+    if provider.requests.len == 2:
+      check provider.requests[1].messages.len == 1
+      check provider.requests[1].messages[0].messageText == "fresh conversation"
+    let previous = store.load(session.id)
+    check previous.error.len == 0
+    check previous.session.messages.len == 2
+    let fresh = store.load(SessionId(chat.sessionId))
+    check fresh.error.len == 0
+    check fresh.session.messages.len == 2
 
   test "cancellation posted before worker start prevents provider I/O":
     let root = temporaryRoot("early-cancel")

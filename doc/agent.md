@@ -3,7 +3,17 @@
 Tsuki starts in the current directory, resumes the most recently updated
 session for that workspace, and opens promptly even when its provider is
 offline. Use `tsuki --help` for CLI options. Without credentials, run
-`/provider` to sign in with ChatGPT or paste an API key for the session.
+`/provider` to sign in with ChatGPT or paste an API key. Keys added this way
+are kept in `credentials.json` under the data directory with owner-only
+permissions, and they take precedence over the provider's environment variable.
+
+When conversation content extends beyond the viewport, its top and bottom
+edges show clickable `↑ Scroll to top` and `↓ Scroll to bottom` controls for
+the corresponding hidden content. Scrolling to the bottom resumes following
+new output. Press Tab to focus the transcript, then Home or End to jump with
+the keyboard. Narrow terminals use shorter labels; transcript regions under
+three rows tall keep their space for content and support wheel and keyboard
+scrolling.
 
 ## Provider configuration
 
@@ -50,6 +60,17 @@ Configured and cached models appear immediately. Credentialed providers
 refresh `/models` on a bounded background worker; successful metadata is
 merged into the open selector and written to a credential-free cache. Static
 models remain usable when discovery is offline.
+
+For a configured reasoning model, add `"reasoningEfforts": ["low", "high"]`
+and optionally `"defaultReasoningEffort": "low"` to its model object, using
+only levels supported by that provider and model. Codex and OpenRouter expose
+these choices through discovery when their catalogs include effort metadata.
+The provider default leaves the request's effort unset; explicit selections
+are saved with the session. Requests use Codex's `effort`, Chat Completions'
+`reasoning_effort`, or OpenRouter's `reasoning.effort` field. See the
+[Codex App Server documentation](https://learn.chatgpt.com/docs/app-server),
+[OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model),
+and [OpenRouter reasoning documentation](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
 ### OpenRouter
 
@@ -131,15 +152,38 @@ rest of the conversation unreadable.
   exiting. Submitting an exact command runs it.
 - `/new`, `/sessions`, `/resume <id>`, `/rename <title>` manage sessions.
 - `/provider` opens the sign-in dialog: ChatGPT device sign-in, or a masked
-  in-memory API key field for key-based providers. `/model` is the only place
-  models are chosen. Ctrl-O opens the model dialog too.
+  API key field for key-based providers. A rejected key reopens the field with
+  the reason; an accepted key closes the dialog and confirms on the activity
+  line. `/model` is the only place models are chosen, and a confirmed choice
+  shows the same way. Ctrl-O opens the model dialog too.
+- In `/model`, Up/Down selects a model and Enter opens a second step for
+  reasoning. Up/Down selects a supported level or the provider default;
+  Enter applies both choices. Escape returns to model selection, then closes
+  the dialog. Models without effort metadata offer only the default and show
+  "Reasoning: not configurable".
+- The bottom status bar groups the directory name (`⌂`), model (`◇`), and
+  reasoning (`✦`) on the left, using muted, bold, and accent styling.
+  Routine provider, agent-mode, and ready labels are omitted; offline, saving,
+  and exhausted request limits stay explicit. Context usage sits on the right.
+  The provider default is labeled `default`. A green-to-amber-to-red
+  meter includes a position marker and percentage. Wide terminals also show used/total tokens;
+  narrower terminals keep the percentage visible. Unknown capacity shows `?`.
+  Usage estimates update during requests and yield to reported token usage
+  when available, including Codex's token-usage notifications.
+- Dragging with the mouse selects screen cells like a terminal. Releasing the
+  button copies the selected text through OSC 52 when the terminal supports it
+  and through the platform clipboard tool (`pbcopy`, `wl-copy`, `xclip`,
+  `xsel`, or `clip`) when one is installed.
 - `/login` and `/logout` manage the ChatGPT Codex subscription account.
 - `/attach <path>` explicitly stages an image; `/detach [name]` removes it.
 - `/retry` creates a linked new attempt without deleting partial output.
 - `/help` lists commands; `/quit` saves, cancels, restores the terminal, and
-  exits. `/clear` is deliberately non-destructive and points to `/new`.
-- Ctrl-C cancels a foreground turn. Enter confirms selector choices; Escape
-  closes overlays. All actions are keyboard reachable and capability labels
+  exits. `/clear` starts a fresh session, clearing the conversation and model
+  context. The previous session remains available in `/sessions`.
+- Escape cancels a foreground turn and keeps the app open when idle. It closes
+  overlays and command suggestions first, and rejects pending approvals.
+  Ctrl-C cancels a foreground turn; pressing it twice exits. Enter confirms
+  selector choices. All actions are keyboard reachable and capability labels
   contain text rather than color-only meaning.
 
 ## Attachments
