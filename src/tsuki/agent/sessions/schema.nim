@@ -18,6 +18,7 @@ type
     updatedAtMs*: int64
     providerId*: ProviderId
     modelId*: ModelId
+    mode*: SessionMode
     interrupted*: bool
     archived*: bool
 
@@ -136,6 +137,7 @@ proc encodeSession*(session: Session): string =
   result.putString "providerId", $session.providerId
   result.putString "modelId", $session.modelId
   result.putString "reasoningEffort", session.reasoningEffort
+  result.putString "mode", $session.mode
   result.putKey "attachments"
   result.add '['
   for attachment in session.stagedAttachments:
@@ -262,6 +264,7 @@ proc decodeSession*(source: string,
       providerId: ProviderId(root.boundedString("providerId", 256).safeId(256)),
       modelId: ModelId(root.boundedString("modelId", 1024).safeDisplay(1024)),
       reasoningEffort: root.boundedString("reasoningEffort", 64).safeId(64),
+      mode: enumValue(root{"mode"}.getStr, modeAgent),
       lastTurnState: enumValue(root{"lastTurnState"}.getStr, turnInterrupted),
       archived: root{"archived"}.getBool)
     if $result.session.id == "" or result.session.workspaceRoot.len == 0:
@@ -388,6 +391,8 @@ proc decodeSessionHeader*(source: string,
       of "modelId":
         result.header.modelId = ModelId(
           parser.takeString(key, 1024).safeDisplay(1024))
+      of "mode":
+        result.header.mode = enumValue(parser.takeString(key, 64), modeAgent)
       of "lastTurnState":
         lastTurnState = parser.takeString(key, 64)
       of "archived":

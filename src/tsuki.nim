@@ -387,7 +387,8 @@ proc sessionEntries(listed: SessionListResult): seq[SessionPickerEntry] =
     result.add SessionPickerEntry(id: $session.id, title: session.title,
       workspace: session.workspaceRoot,
       updatedLabel: session.updatedAtMs.updatedLabel,
-      providerModel: $session.providerId & "/" & $session.modelId,
+      providerModel: $session.providerId & "/" & $session.modelId &
+        (if session.mode == modeChat: " · chat" else: ""),
       interrupted: session.interrupted)
   for diagnostic in listed.diagnostics:
     result.add SessionPickerEntry(id: diagnostic.path,
@@ -454,6 +455,8 @@ proc runTsuki*(arguments: seq[string]): int =
     session.modelId = cli.modelId
   elif $session.modelId == "":
     session.modelId = config.defaultModel
+  if cli.mode == "chat": session.mode = modeChat
+  elif cli.mode == "agent": session.mode = modeAgent
 
   var models = config.configuredModels
   let cached = loadModelCache(defaults.modelCacheFile)
@@ -499,8 +502,15 @@ proc runTsuki*(arguments: seq[string]): int =
   let chat = initAgentChat(session.title, $session.id)
   chat.projectSession(session)
   if session.messages.len == 0:
-    chat.apply notice("welcome", "月  tsuki\n    a fast, tiny coding agent\n\n" &
-      "Type a request, or use /help for commands.", banner = true)
+    chat.apply notice("welcome", if session.mode == modeChat:
+      "月  tsuki\n    chat mode\n\n" &
+        "Ask anything or plan something. The workspace is not read.\n" &
+        "/agent returns to the workspace. /help lists commands."
+      else:
+        "月  tsuki\n    a fast, tiny coding agent\n\n" &
+        "Type a request, or use /help for commands.\n" &
+        "/chat talks or plans without reading the workspace.",
+      banner = true)
   if loadedConfig.error.len > 0:
     chat.apply agentError("config-error", loadedConfig.error &
       "\nConfiguration: " & loadedConfig.path)
@@ -552,18 +562,21 @@ proc runTsuki*(arguments: seq[string]): int =
     not adapterValidation.ok
   let startupAuth = config.authEntries(storedKey)
   var availableSelectors = config.selectorEntries(models, storedKey)
+  let statusDirectory = if session.mode == modeChat: "" else: workspace
   chat.apply agentui.selectorUpdated(availableSelectors)
   chat.apply agentui.authUpdated(startupAuth)
   chat.apply agentui.sessionsUpdated(currentListed.sessionEntries)
   chat.apply agentui.statusUpdated(agentui.AgentViewStatus(
-    provider: $session.providerId, model: $session.modelId, mode: "agent",
+    provider: $session.providerId, model: $session.modelId,
+    mode: $session.mode,
     message: if offline: "offline" else: "ready", offline: offline,
-    contextLimit: selected.contextWindow, directory: workspace,
+    contextLimit: selected.contextWindow, directory: statusDirectory,
     reasoningEffort: session.reasoningEffort))
   let options = agentTuiOptions(status = AgentStatus(
-    provider: $session.providerId, model: $session.modelId, mode: "agent",
+    provider: $session.providerId, model: $session.modelId,
+    mode: $session.mode,
     message: if offline: "offline" else: "ready", offline: offline,
-    directory: workspace, reasoningEffort: session.reasoningEffort),
+    directory: statusDirectory, reasoningEffort: session.reasoningEffort),
     selectorEntries = availableSelectors,
     authEntries = startupAuth,
     sessionEntries = currentListed.sessionEntries,
@@ -737,6 +750,16 @@ proc runTsuki*(arguments: seq[string]): int =
           else: commandLogout
         discard controller.post ControllerCommand(kind: commandKind,
           adapter: authAdapter)
+    of aaSetMode:
+      case action.argument
+      of "chat":
+        discard controller.post ControllerCommand(kind: commandSetMode,
+          mode: modeChat)
+      of "agent":
+        discard controller.post ControllerCommand(kind: commandSetMode,
+          mode: modeAgent)
+      else:
+        discard chat.post notice("mode-usage", "Use /chat or /agent.")
     of aaApproval:
       discard
     of aaCopy:

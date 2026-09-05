@@ -23,6 +23,16 @@ proc parseCli*(arguments: openArray[string]): CliParseResult =
     of "-h", "--help": result.help = true
     of "--version": result.version = true
     of "--new": result.options.newSession = true
+    of "--chat": result.options.mode = "chat"
+    of "--mode":
+      var value: string
+      takeValue(value, argument)
+      let mode = value.toLowerAscii
+      if mode notin ["agent", "chat"]:
+        result.error = "unknown mode: " & value.safeDisplay(256) &
+          " (use agent or chat)"
+        return
+      result.options.mode = mode
     of "--workspace", "-C":
       takeValue(result.options.workspace, argument)
     of "--config":
@@ -60,6 +70,8 @@ const cliHelp* = """Usage: tsuki [options] [workspace]
 Options:
   -C, --workspace <path>      Workspace root (default: current directory)
   --new                       Start a new session
+  --chat                      Chat or plan without reading the workspace
+  --mode <agent|chat>         Set the session mode explicitly
   --session <id>              Resume an exact session
   --provider <id>             Select a configured provider
   --model <id>                Select a model

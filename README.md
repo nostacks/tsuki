@@ -70,6 +70,13 @@ Start without credentials and add a key in the app:
 ```sh
 ./build/tsuki --new
 ```
+
+Chat or plan without reading the current directory, or switch with `/chat`
+and `/agent` inside the app:
+
+```sh
+./build/tsuki --chat
+```
 ## Examples
 
 The repository keeps three public examples:

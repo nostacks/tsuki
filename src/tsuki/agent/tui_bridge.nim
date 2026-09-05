@@ -117,9 +117,10 @@ proc tuiEventSink*(chat: ui.AgentChat,
       discard chat.post ui.turnCancelled(event.id)
     of controllerStatus:
       discard chat.post ui.statusUpdated(ui.AgentViewStatus(
-        provider: $event.providerId, model: $event.modelId, mode: "agent",
-        message: event.text, contextUsed: event.contextUsed,
-        directory: event.directory, reasoningEffort: event.reasoningEffort,
+        provider: $event.providerId, model: $event.modelId,
+        mode: $event.mode, message: event.text, contextUsed: event.contextUsed,
+        directory: if event.mode == modeChat: "" else: event.directory,
+        reasoningEffort: event.reasoningEffort,
         contextLimit: event.contextLimit, offline: event.offline,
         saving: event.saving))
     of controllerAttachmentStaged:

@@ -704,4 +704,65 @@ suite "phase 1 product core":
         .contains("answer.txt")
       check loaded.session.messages[3].messageText == "I found answer.txt."
 
+  test "chat mode drops tools and the workspace from requests and persists":
+    let root = temporaryRoot("chat-mode")
+    defer:
+      if dirExists(root): removeDir(root)
+    createDir(root)
+    let store = initSessionStore(platformPaths(home = root,
+      dataOverride = root / "data"))
+    let provider = newMockProvider(scripts = @[
+      @[MockStep(kind: mockStart), mockText("Here is a plan."),
+        MockStep(kind: mockComplete)]])
+    let session = newSession(SessionId("s-chat"), root,
+      provider.id, provider.models[0].id, 1)
+    check session.mode == modeAgent
+    var noticeIds: seq[string]
+    var statusModes: seq[SessionMode]
+    let controller = initAgentController(session, store, provider,
+      provider.models[0], proc (event: ControllerEvent) {.gcsafe.} =
+      {.cast(gcsafe).}:
+        if event.kind == controllerNotice: noticeIds.add event.id
+        elif event.kind == controllerStatus: statusModes.add event.mode)
+    check controller.toolPolicy.enabled
+    check controller.post ControllerCommand(kind: commandSetMode,
+      mode: modeChat)
+    check controller.post ControllerCommand(kind: commandSetMode,
+      mode: modeChat)
+    check controller.post ControllerCommand(kind: commandSubmit,
+      text: "Help me plan a release.")
+    check controller.post ControllerCommand(kind: commandNewSession)
+    check controller.post ControllerCommand(kind: commandShutdown)
+    controller.run()
+    check "mode-chat" in noticeIds and "mode-unchanged" in noticeIds
+    check modeChat in statusModes
+    check provider.requests.len == 1
+    if provider.requests.len == 1:
+      let request = provider.requests[0]
+      check request.tools.len == 0
+      check request.systemInstruction.contains("chat mode")
+      check not request.systemInstruction.contains(root)
+      check request.systemInstruction.contains("/agent")
+    let loaded = store.load(SessionId("s-chat"))
+    check loaded.error.len == 0
+    check loaded.session.mode == modeChat
+    check loaded.session.messages.len == 2
+    let encoded = encodeSession(loaded.session)
+    check parseJson(encoded){"mode"}.getStr == "chat"
+    check decodeSessionHeader(encoded).header.mode == modeChat
+    check controller.session.id != SessionId("s-chat")
+    check controller.session.mode == modeChat
+    let resumed = initAgentController(loaded.session, store, provider,
+      provider.models[0], proc (event: ControllerEvent) {.gcsafe.} =
+      discard event)
+    check not resumed.toolPolicy.enabled
+    check tsukiSystemInstruction(root, true, modeAgent).contains(root)
+    let legacy = decodeSession(
+      encodeSession(newSession(SessionId("s-legacy"), root))
+      .replace(""","mode":"agent"""", ""))
+    check legacy.error.len == 0 and legacy.session.mode == modeAgent
+    check decodeSession(encodeSession(newSession(SessionId("s-bad"), root))
+      .replace(""""mode":"agent"""", """"mode":"weird""""))
+      .session.mode == modeAgent
+
 echo "phase1 agent ok"

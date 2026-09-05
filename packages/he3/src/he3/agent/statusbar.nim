@@ -110,15 +110,19 @@ proc statusBar*(frame: Frame, status: AgentStatus, usage = Usage(),
   elif status.message.len > 0 and status.message notin ["ready", "idle",
       "saved", "streaming", "streaming · context estimate", "signed in"]:
     notice = cleanLabel(status.message)
-  elif status.mode.len > 0 and status.mode != "agent":
-    notice = cleanLabel(status.mode)
-  # Keep the selected effort and exceptional state visible before budgeting
-  # identity text. Ordinary provider/mode/ready labels repeat known state.
+  let modeLabel = if status.mode.len > 0 and status.mode != "agent":
+      "◌ " & cleanLabel(status.mode) else: ""
+  # Keep the mode, selected effort, and exceptional state visible before
+  # budgeting identity text. Ordinary provider/ready labels repeat known state.
   let noticeWidth = min(notice.cellWidth, leftWidth)
   let noticeSpace = noticeWidth + (if noticeWidth > 0: 2 else: 0)
-  let reasoningWidth = min(reasoning.cellWidth, max(0, leftWidth - noticeSpace))
+  let modeWidth = min(modeLabel.cellWidth, max(0, leftWidth - noticeSpace))
+  let modeSpace = modeWidth + (if modeWidth > 0: 2 else: 0)
+  let reasoningWidth = min(reasoning.cellWidth,
+    max(0, leftWidth - noticeSpace - modeSpace))
   let reasoningSpace = reasoningWidth + (if reasoningWidth > 0: 2 else: 0)
-  let identityWidth = max(0, leftWidth - reasoningSpace - noticeSpace)
+  let identityWidth = max(0, leftWidth - reasoningSpace - modeSpace -
+    noticeSpace)
   var xLeft = 0
   proc part(label: string, style: Style, budget: int) =
     if label.len == 0 or budget <= 0: return
@@ -127,6 +131,8 @@ proc statusBar*(frame: Frame, status: AgentStatus, usage = Usage(),
       xLeft += 2
     frame.write(xLeft, 0, clipped, style)
     xLeft += clipped.cellWidth
+  part(modeLabel, colors.base.accent, modeWidth)
+  let identityStart = xLeft
   if status.directory.len > 0:
     let budget = if status.model.len > 0: identityWidth div 2
       else: identityWidth
@@ -134,7 +140,8 @@ proc statusBar*(frame: Frame, status: AgentStatus, usage = Usage(),
       part("⌂ " & directoryLabel(status.directory, budget - 2),
         colors.base.muted, budget)
   if status.model.len > 0:
-    let budget = identityWidth - xLeft - (if xLeft > 0: 2 else: 0)
+    let consumed = xLeft - identityStart
+    let budget = identityWidth - consumed - (if consumed > 0: 2 else: 0)
     if budget >= 3:
       part("◇ " & cleanLabel(status.model), colors.base.text.bold, budget)
   part(reasoning, colors.base.accent, reasoningWidth)

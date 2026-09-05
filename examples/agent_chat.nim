@@ -74,6 +74,9 @@ proc handleAction(action: AgentAction) =
   of aaLogin, aaLogout:
     discard chat.post notice("authentication", "The public mock example does " &
       "not connect to an account. Use the tsuki executable for /provider.")
+  of aaSetMode:
+    discard controller.post ControllerCommand(kind: commandSetMode,
+      mode: if action.argument == "chat": modeChat else: modeAgent)
   of aaApproval, aaCopy:
     discard
 

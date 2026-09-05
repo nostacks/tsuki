@@ -145,6 +145,12 @@ type
     turnInterrupted
     turnShuttingDown
 
+  SessionMode* = enum
+    ## Agent mode exposes the read-only workspace tools. Chat mode names no
+    ## workspace and sends no tools, so nothing is read from the directory.
+    modeAgent = "agent"
+    modeChat = "chat"
+
   Session* = object
     schemaVersion*: int
     id*: SessionId
@@ -155,6 +161,7 @@ type
     providerId*: ProviderId
     modelId*: ModelId
     reasoningEffort*: string ## Empty delegates to the provider default.
+    mode*: SessionMode
     stagedAttachments*: seq[ImageReference]
     messages*: seq[Message]
     lastTurnState*: TurnState
@@ -299,9 +306,10 @@ proc initialSessionTitle*(prompt: string): string =
 
 proc newSession*(id: SessionId, workspaceRoot: string,
     providerId = ProviderId(""), modelId = ModelId(""),
-    timestampMs = -1'i64): Session =
+    timestampMs = -1'i64, mode = modeAgent): Session =
   let now = if timestampMs >= 0: timestampMs else: unixTimeMs()
   Session(schemaVersion: currentSessionSchemaVersion, id: id,
     title: "New session", workspaceRoot: workspaceRoot,
     createdAtMs: now, updatedAtMs: now,
-    providerId: providerId, modelId: modelId, lastTurnState: turnIdle)
+    providerId: providerId, modelId: modelId, mode: mode,
+    lastTurnState: turnIdle)

@@ -570,6 +570,30 @@ proc testAgentShell =
     check resumeOutcome.changed and
       resumeOutcome.actionKind == aaSessions,
       "/resume without an id opens the session picker"
+    let chatOutcome = runShellCommand(chat, state, "/chat")
+    check chatOutcome.effect == seHostAction and chatOutcome.changed and
+      chatOutcome.actionKind == aaSetMode and chatOutcome.argument == "chat",
+      "/chat asks the host to stop reading the workspace"
+    let agentOutcome = runShellCommand(chat, state, "/agent")
+    check agentOutcome.effect == seHostAction and
+      agentOutcome.actionKind == aaSetMode and
+      agentOutcome.argument == "agent",
+      "/agent asks the host to return to the workspace"
+    discard runShellCommand(chat, state, "/help")
+    check chat.items[^1].content.contains("/chat") and
+      chat.items[^1].content.contains("/agent"),
+      "/help lists both mode commands"
+    var modeHarness = initHeadlessTui(80, 24)
+    let agentFrame = modeHarness.drawShell(chat, state, options)
+    check agentFrame.contains("type a coding request") and
+      not agentFrame.contains("◌"),
+      "agent mode keeps the coding placeholder and no mode label"
+    chat.apply statusUpdated(AgentViewStatus(mode: "chat", message: "ready",
+      model: "mock-tsuki"))
+    let chatFrame = modeHarness.drawShell(chat, state, options)
+    check chatFrame.contains("ask anything or plan something") and
+      chatFrame.contains("◌ chat"),
+      "chat mode changes the placeholder and labels the status bar"
 
   block multilineComposer:
     var state = initAgentUiState()
@@ -687,8 +711,8 @@ proc testAgentShell =
   block slashCompletion:
     var state = initAgentUiState()
     let chat = initAgentChat()
-    state.prompt.editor.content = "/c"
-    state.prompt.editor.cursor = 2
+    state.prompt.editor.content = "/cl"
+    state.prompt.editor.cursor = 3
     check state.prompt.nextCompletion == "/clear",
       "typing filters completion candidates"
     discard handleShellEvent(chat, state,
@@ -1282,6 +1306,23 @@ proc testContextStatus =
     not harness.snapshot.contains("agent") and
     not harness.snapshot.contains("ready"),
     "the compact status groups directory, model, and reasoning without routine labels"
+  status.mode = "chat"
+  harness.draw proc (frame: var Frame) = frame.statusBar(status)
+  check harness.snapshot.contains("◌ chat  ⌂ tsuki  ◇ reasoner  ✦ high"),
+    "a non-agent mode leads the identity group"
+  check harness.buffer.cellAt(0, 0).style == agentTheme().base.accent,
+    "the mode label uses the accent role"
+  status.directory = ""
+  harness.draw proc (frame: var Frame) = frame.statusBar(status)
+  check harness.snapshot.contains("◌ chat  ◇ reasoner  ✦ high") and
+    harness.snapshot.endsWith("50%"),
+    "chat mode without a directory keeps model, reasoning, and context"
+  var narrow = initHeadlessTui(40, 1)
+  narrow.draw proc (frame: var Frame) = frame.statusBar(status)
+  check narrow.snapshot.contains("◌ chat") and narrow.snapshot.endsWith("50%"),
+    "the mode label survives narrow widths"
+  status.mode = "agent"
+  status.directory = "/work/日本/tsuki"
   for base in [darkTheme(), lightTheme(), noColorTheme(), highContrastTheme()]:
     let colors = agentTheme(base)
     harness.draw proc (frame: var Frame) = frame.statusBar(status,

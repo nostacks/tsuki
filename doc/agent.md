@@ -146,6 +146,22 @@ Staged attachment references are saved with the session. On resume, Tsuki
 rechecks them and shows missing, changed, or failed state without making the
 rest of the conversation unreadable.
 
+## Chat mode
+
+`/chat` switches the current session to chat mode, and `tsuki --chat` starts
+in it. Chat mode is for questions, conversation, and planning: Tsuki sends no
+tools, names no workspace in its instruction, and never reads the directory.
+Its instruction asks the model for direct answers, and for plans that clarify
+the goal, weigh options, recommend one, and end with concrete steps. The
+status bar shows `◌ chat` in place of the directory name, the composer
+placeholder changes to match, and the session picker marks chat sessions.
+
+`/agent` returns to the workspace with the read-only tools. The mode is saved
+with the session, so a resumed chat session stays in chat mode, and `/new` or
+`/clear` keeps the current mode. `--mode agent` or `--mode chat` sets the mode
+explicitly when starting or resuming. Explicitly staged images (`/attach`)
+still work in either mode, and modes cannot change during an active turn.
+
 ## Commands and keyboard use
 
 - Typing `/` opens a recommended-command popover. Up/Down moves, Tab or Enter
@@ -156,6 +172,8 @@ rest of the conversation unreadable.
   Home, and End scroll it too. A failure inside the shell restores the
   terminal and prints the reason instead of leaving the screen behind.
 - `/new`, `/sessions`, `/resume <id>`, `/rename <title>` manage sessions.
+- `/chat` talks or plans without reading the workspace; `/agent` returns to
+  the workspace with read-only tools. See [Chat mode](#chat-mode).
 - `/provider` opens the provider dialog: Enter starts ChatGPT device sign-in
   or opens a masked API key field for key-based providers, and Delete signs
   out of a ChatGPT entry. A rejected key reopens the field with
@@ -168,7 +186,8 @@ rest of the conversation unreadable.
   the dialog. Models without effort metadata offer only the default and show
   "Reasoning: not configurable".
 - The bottom status bar groups the directory name (`⌂`), model (`◇`), and
-  reasoning (`✦`) on the left, using muted, bold, and accent styling.
+  reasoning (`✦`) on the left, using muted, bold, and accent styling. A
+  non-agent mode (`◌ chat`) leads the group in accent styling.
   Routine provider, agent-mode, and ready labels are omitted; offline, saving,
   and exhausted request limits stay explicit. Context usage sits on the right.
   The provider default is labeled `default`. A green-to-amber-to-red

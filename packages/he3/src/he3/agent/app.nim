@@ -30,6 +30,11 @@ const agentCommands* = [
   SlashCommand(name: "/provider", usage: "/provider",
     description: "Sign in, sign out, or add a provider key",
     recommended: true),
+  SlashCommand(name: "/chat", usage: "/chat",
+    description: "Talk or plan without reading the workspace",
+    recommended: true),
+  SlashCommand(name: "/agent", usage: "/agent",
+    description: "Return to the workspace with read-only tools"),
   SlashCommand(name: "/detach", usage: "/detach [name]",
     description: "Remove a staged image"),
   SlashCommand(name: "/clear", usage: "/clear",
@@ -56,6 +61,7 @@ type
     aaArchiveSession
     aaLogin
     aaLogout
+    aaSetMode
 
   AgentAction* = object
     kind*: AgentActionKind
@@ -333,7 +339,7 @@ proc drawCommandPopover(frame: Frame, state: PromptState,
   ## Draws a compact overlay above the composer without changing shell layout.
   let suggestions = state.slashSuggestions
   if suggestions.len == 0 or composer.y < 4 or frame.rect.width < 24: return
-  let rowCount = min(suggestions.len, min(6, max(1, composer.y - 3)))
+  let rowCount = min(suggestions.len, min(7, max(1, composer.y - 3)))
   let height = rowCount + 3
   let width = min(72, max(24, frame.rect.width - 4))
   let x = clamp(composer.x + 1, 0, max(0, frame.rect.width - width))
@@ -440,8 +446,12 @@ proc drawAgentShell*(frame: var Frame, chat: AgentChat,
         layout.attachments.width, 1)).attachmentCard(value, value.state,
         dimensions, value.altText, colors)
   if layout.composer.height > 0:
+    let mode = if chat.status.mode.len > 0: chat.status.mode
+      else: options.status.mode
     frame.sub(layout.composer).prompt(state.prompt,
-      state.focus == focusPrompt, colors = colors)
+      state.focus == focusPrompt,
+      placeholder = if mode == "chat": "ask anything or plan something"
+        else: "type a coding request", colors = colors)
   if layout.divider.height > 0:
     frame.sub(layout.divider).rule(style = colors.base.border)
   if layout.status.height > 0:
@@ -617,6 +627,8 @@ proc runShellCommand*(chat: AgentChat, state: var AgentUiState,
       "/rename <title>  rename this session\n" &
       "/provider  sign in, sign out, or add a provider API key\n" &
       "/model  choose any provider and model\n" &
+      "/chat  talk or plan without reading the workspace (no tools)\n" &
+      "/agent  return to the workspace with read-only tools\n" &
       "/attach <path>, /detach [name]  stage or remove an image\n" &
       "/retry  retry the last user turn\n" &
       "/clear  clear the conversation and start a fresh session\n" &
@@ -653,6 +665,12 @@ proc runShellCommand*(chat: AgentChat, state: var AgentUiState,
   of "/model":
     ShellOutcome(effect: seHostAction, changed: true,
       actionKind: aaModelSelector)
+  of "/chat":
+    ShellOutcome(effect: seHostAction, changed: true,
+      actionKind: aaSetMode, argument: "chat")
+  of "/agent":
+    ShellOutcome(effect: seHostAction, changed: true,
+      actionKind: aaSetMode, argument: "agent")
   of "/attach":
     if argument.len > 0:
       ShellOutcome(effect: seHostAction, changed: true,

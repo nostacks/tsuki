@@ -11,6 +11,7 @@ type
     commandCancel
     commandRetry
     commandSelectModel
+    commandSetMode
     commandSwitchSession
     commandNewSession
     commandAttach
@@ -33,6 +34,7 @@ type
     toolsEnabled*: bool
     toolsConfigured*: bool
     reasoningEffort*: string
+    mode*: SessionMode
 
   ControllerEventKind* = enum
     controllerUserMessage
@@ -76,6 +78,7 @@ type
     modelId*: ModelId
     directory*: string
     reasoningEffort*: string
+    mode*: SessionMode
     contextUsed*: int64
     contextLimit*: int64
     offline*: bool
@@ -179,6 +182,23 @@ func defaultRetryPolicy*(): RetryPolicy =
   RetryPolicy(maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 4_000,
     wait: defaultWait)
 
+proc syncToolPolicy(controller: AgentController) =
+  ## Chat mode wins over host and model tool support, so nothing can read
+  ## the workspace until the session returns to agent mode.
+  controller.toolPolicy.enabled = controller.session.mode == modeAgent and
+    controller.hostToolsEnabled and
+    controller.model.capabilities.tools != capabilityUnsupported
+
+func modeNotice(mode: SessionMode, workspaceRoot: string): string =
+  case mode
+  of modeChat:
+    "Chat mode. Tsuki will not read this directory or run tools.\n" &
+      "Good for questions, conversation, and planning. " &
+      "/agent returns to the workspace."
+  of modeAgent:
+    "Agent mode. Tsuki can inspect " & workspaceRoot.safeDisplay(4096) &
+      " with read-only tools.\n/chat talks or plans without reading files."
+
 proc initAgentController*(session: Session, store: SessionStore,
     adapter: ProviderAdapter, model: ModelDescriptor,
     emit: ControllerEventProc, limits = phase1Limits(),
@@ -198,9 +218,8 @@ proc initAgentController*(session: Session, store: SessionStore,
   result.staged = result.session.stagedAttachments
   result.state = if session.lastTurnState == turnInterrupted:
     turnInterrupted else: turnIdle
-  result.toolPolicy = defaultToolPolicy(session.workspaceRoot,
-    enabled = toolsEnabled and
-      model.capabilities.tools != capabilityUnsupported)
+  result.toolPolicy = defaultToolPolicy(session.workspaceRoot)
+  result.syncToolPolicy()
 
 proc send(controller: AgentController, event: ControllerEvent) =
   if not controller.emit.isNil: controller.emit(event)
@@ -213,6 +232,7 @@ proc postStatus(controller: AgentController, message = "", offline = false,
     modelId: controller.session.modelId, contextUsed: controller.contextUsed,
     directory: controller.session.workspaceRoot,
     reasoningEffort: controller.session.reasoningEffort,
+    mode: controller.session.mode,
     contextLimit: controller.model.contextWindow, offline: offline,
     saving: saving)
 
@@ -812,9 +832,7 @@ proc handle(controller: AgentController, command: ControllerCommand) =
         controller.hostToolsEnabled = command.toolsEnabled
       controller.session.providerId = command.model.providerId
       controller.session.modelId = command.model.id
-      controller.toolPolicy.enabled =
-        controller.hostToolsEnabled and
-        command.model.capabilities.tools != capabilityUnsupported
+      controller.syncToolPolicy()
       discard controller.checkpoint(force = true)
       let validation = controller.adapter.validate()
       if validation.ok:
@@ -825,6 +843,21 @@ proc handle(controller: AgentController, command: ControllerCommand) =
             command.model.displayName)
       else:
         controller.postStatus(validation.message, offline = true)
+  of commandSetMode:
+    if not controller.state.terminal:
+      controller.send ControllerEvent(kind: controllerNotice,
+        id: "mode-busy", text: "Cancel the active turn before switching modes.")
+    elif controller.session.mode == command.mode:
+      controller.send ControllerEvent(kind: controllerNotice,
+        id: "mode-unchanged", text: "Already in " & $command.mode & " mode.")
+    else:
+      controller.session.mode = command.mode
+      controller.syncToolPolicy()
+      discard controller.checkpoint(force = true)
+      controller.send ControllerEvent(kind: controllerNotice,
+        id: "mode-" & $command.mode,
+        text: modeNotice(command.mode, controller.session.workspaceRoot))
+      controller.postStatus("ready")
   of commandSwitchSession:
     if not controller.state.terminal:
       discard controller.requestCancel()
@@ -858,8 +891,7 @@ proc handle(controller: AgentController, command: ControllerCommand) =
             displayName: $loaded.session.modelId, available: false,
             unavailableReason: "The session model is no longer configured.",
             provenance: provenanceCached)
-        controller.toolPolicy.enabled = controller.hostToolsEnabled and
-          controller.model.capabilities.tools != capabilityUnsupported
+        controller.syncToolPolicy()
         controller.emitSession()
         controller.send ControllerEvent(kind: controllerSessionsChanged,
           text: controller.session.workspaceRoot)
@@ -869,7 +901,7 @@ proc handle(controller: AgentController, command: ControllerCommand) =
       let effort = controller.session.reasoningEffort
       controller.session = newSession(generateSessionId(),
         controller.session.workspaceRoot, controller.session.providerId,
-        controller.session.modelId)
+        controller.session.modelId, mode = controller.session.mode)
       controller.session.reasoningEffort = effort
       controller.staged.setLen 0
       controller.state = turnIdle
@@ -943,7 +975,7 @@ proc handle(controller: AgentController, command: ControllerCommand) =
     elif target == controller.session.id:
       controller.session = newSession(generateSessionId(),
         controller.session.workspaceRoot, controller.session.providerId,
-        controller.session.modelId)
+        controller.session.modelId, mode = controller.session.mode)
       controller.staged.setLen 0
       controller.state = turnIdle
       discard controller.checkpoint(force = true)

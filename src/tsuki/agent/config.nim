@@ -44,6 +44,7 @@ type
     workspace*: string
     sessionId*: SessionId
     newSession*: bool
+    mode*: string ## "agent", "chat", or empty to keep the session's mode.
 
   ConfigLoadResult* = object
     config*: TsukiConfig
