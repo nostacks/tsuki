@@ -1,44 +1,75 @@
-import std/strutils
 import ../graphemes
 import ../render
+import ../text
 
-func wordWidth(word: string): int =
-  for cluster in word.graphemes:
-    result += cluster.clusterWidth
+type
+  Piece = object
+    ## One byte range of the source placed on a wrapped row, preceded by a
+    ## single space when `spaced` is set.
+    a: int
+    b: int
+    spaced: bool
 
-func wrapLine(rows: var seq[string], line: string, width: int) =
-  var cur = ""
+  Wrapped = object
+    ## Wrapped rows as ranges into a flat piece list; row `i` owns pieces
+    ## `rowStarts[i] ..< rowStarts[i + 1]` (or to the end for the last row).
+    pieces: seq[Piece]
+    rowStarts: seq[int]
+
+func rowCount(wrapped: Wrapped): int {.inline.} =
+  wrapped.rowStarts.len
+
+func rowEnd(wrapped: Wrapped, row: int): int {.inline.} =
+  if row + 1 < wrapped.rowStarts.len: wrapped.rowStarts[row + 1]
+  else: wrapped.pieces.len
+
+func wrapLine(wrapped: var Wrapped, text: openArray[char], lineA, lineB: int,
+    width: int) =
   var curW = 0
+  var curLen = 0
   var sawWord = false
-  for word in line.split(' '):
-    if word.len == 0:
+  wrapped.rowStarts.add wrapped.pieces.len
+  template newRow() =
+    wrapped.rowStarts.add wrapped.pieces.len
+    curW = 0
+    curLen = 0
+  var i = lineA
+  while i < lineB:
+    if text[i] == ' ':
+      inc i
       continue
+    var j = i
+    while j < lineB and text[j] != ' ':
+      inc j
     sawWord = true
-    let ww = wordWidth(word)
+    let ww = textWidth(text.toOpenArray(i, j - 1))
     if curW > 0 and curW + 1 + ww <= width:
-      cur.add ' '
-      cur.add word
+      wrapped.pieces.add Piece(a: i, b: j - 1, spaced: true)
       inc curW, 1 + ww
+      inc curLen, 1 + j - i
+      i = j
       continue
     if curW > 0:
-      rows.add cur
-      cur = ""
-      curW = 0
-    for cluster in word.graphemes:
-      let w = cluster.clusterWidth
+      newRow()
+    for cluster in text.toOpenArray(i, j - 1).graphemeSpans:
+      let a = i + cluster.a
+      let b = i + cluster.b
+      let w = clusterWidth(text.toOpenArray(a, b))
       if curW + w > width:
         if curW > 0:
-          rows.add cur
-          cur = ""
-          curW = 0
+          newRow()
         if w > width:
           continue
-      cur.add cluster
+      if curLen > 0 and wrapped.pieces.len > wrapped.rowStarts[^1] and
+          wrapped.pieces[^1].b + 1 == a:
+        wrapped.pieces[^1].b = b
+      else:
+        wrapped.pieces.add Piece(a: a, b: b)
       inc curW, w
-  if cur.len > 0:
-    rows.add cur
-  elif not sawWord:
-    rows.add ""
+      inc curLen, b - a + 1
+    i = j
+  if curLen == 0 and sawWord:
+    wrapped.rowStarts.setLen(wrapped.rowStarts.len - 1)
 
 proc paragraph*(f: Frame, text: string, scroll = 0, wrap = true) =
   ## Renders `text` into `f.rect` with greedy word wrapping. When `wrap` is
@@ -53,18 +84,37 @@ proc paragraph*(f: Frame, text: string, scroll = 0, wrap = true) =
     return
   let sc = max(0, scroll)
   if not wrap:
-    let lines = text.split('\n')
     var y = 0
-    for i in sc ..< min(lines.len, sc + f.rect.height):
-      f.write(0, y, lines[i])
-      inc y
+    var lineIndex = 0
+    var lineA = 0
+    while lineA <= text.len and y < f.rect.height:
+      var lineB = lineA
+      while lineB < text.len and text[lineB] != '\n':
+        inc lineB
+      if lineIndex >= sc:
+        f.write(0, y, text.toOpenArray(lineA, lineB - 1), f.style)
+        inc y
+      inc lineIndex
+      lineA = lineB + 1
     return
-  var rows: seq[string]
-  for line in text.split('\n'):
-    wrapLine(rows, line, f.rect.width)
-  let avail = rows.len - sc
+  var wrapped: Wrapped
+  var lineA = 0
+  while lineA <= text.len:
+    var lineB = lineA
+    while lineB < text.len and text[lineB] != '\n':
+      inc lineB
+    wrapped.wrapLine(text, lineA, lineB, f.rect.width)
+    lineA = lineB + 1
+  let avail = wrapped.rowCount - sc
   if avail <= 0:
     return
   let start = max(0, avail - f.rect.height)
-  for i in start ..< avail:
-    f.write(0, i - start, rows[i])
+  var rowText = ""
+  for row in start ..< avail:
+    rowText.setLen 0
+    for index in wrapped.rowStarts[row] ..< wrapped.rowEnd(row):
+      let piece = wrapped.pieces[index]
+      if piece.spaced:
+        rowText.add ' '
+      rowText.addChars text.toOpenArray(piece.a, piece.b)
+    f.write(0, row - start, rowText)

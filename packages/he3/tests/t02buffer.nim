@@ -103,9 +103,54 @@ proc testProps =
     check readback.strip == s[0 ..< min(s.len, 20 - x)],
       "readback reproduces written string"
 
+proc testScrollRows =
+  var b = initBuffer(3, 4)
+  for y in 0 ..< 4:
+    b.writeStr(0, y, $y & "ab")
+  var up = b
+  up.scrollRows(1, 2, 1)
+  check up.cellAt(0, 0).rune == Rune(ord('0')) and
+    up.cellAt(0, 3).rune == Rune(ord('3')), "rows outside the region stay"
+  check up.cellAt(0, 1).rune == Rune(ord('2')) and
+    up.cellAt(1, 1).rune == Rune(ord('a')), "rows inside move up"
+  check up.cellAt(0, 2) == defaultCell(), "the exposed row is blank"
+  var down = b
+  down.scrollRows(0, 4, -2)
+  check down.cellAt(0, 2).rune == Rune(ord('0')) and
+    down.cellAt(0, 3).rune == Rune(ord('1')), "rows move down"
+  check down.cellAt(0, 0) == defaultCell() and
+    down.cellAt(0, 1) == defaultCell(), "exposed top rows are blank"
+  var whole = b
+  whole.scrollRows(0, 4, 9)
+  for y in 0 ..< 4:
+    check whole.cellAt(0, y) == defaultCell(), "over-scrolling blanks all rows"
+  var untouched = b
+  untouched.scrollRows(2, 5, 1)
+  check untouched == b, "an out-of-range region is ignored"
+  check untouched.checkInvariants, "scrolled buffers keep invariants"
+
+proc testScrollHint =
+  var b = initBuffer(4, 4)
+  b.hintScroll(initRect(0, 0, 4, 4), 0)
+  check b.scrollHint.rows == 0, "a zero move records nothing"
+  b.hintScroll(initRect(0, 0, 4, 4), 2)
+  check b.scrollHint.rows == 2 and b.scrollHint.region == initRect(0, 0, 4, 4),
+    "hint recorded"
+  b.hintScroll(initRect(0, 0, 4, 4), 2)
+  check b.scrollHint.rows == 2, "an identical hint is idempotent"
+  b.hintScroll(initRect(0, 1, 4, 2), 1)
+  check b.scrollHint.rows == 0, "a different hint cancels"
+  b.hintScroll(initRect(0, 0, 4, 4), 3)
+  check b.scrollHint.rows == 0, "the conflict persists for the frame"
+  b.reset()
+  b.hintScroll(initRect(0, 0, 4, 4), 3)
+  check b.scrollHint.rows == 3, "reset clears the conflict"
+
 proc main =
   testBasics()
   testResize()
+  testScrollRows()
+  testScrollHint()
   testWriteStr()
   testNewline()
   testWideChars()

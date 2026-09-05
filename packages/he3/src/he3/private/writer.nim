@@ -28,6 +28,7 @@ type
     curValid*: bool
     truecolor*: bool
     syncOutput*: bool
+    scrollRegions*: bool
     case kind*: OutKind
     of outTty:
       fd*: cint
@@ -130,6 +131,21 @@ func rowContentEnd*(b: Buffer, y: int): int =
   result = b.width
   while result > 0 and b.cells[base + result - 1].isBlank:
     dec result
+
+proc addScrollRegion*(f: var seq[byte], top, bottom, rows: int) =
+  ## Appends a scroll of `rows` lines (positive is up) confined to the
+  ## one-based rows `top .. bottom`, leaving the margins reset afterwards.
+  f.add byte(0x1b)
+  f.add byte('[')
+  f.addUInt top
+  f.add byte(';')
+  f.addUInt bottom
+  f.add byte('r')
+  f.add byte(0x1b)
+  f.add byte('[')
+  f.addUInt abs(rows)
+  f.add byte(if rows > 0: 'S' else: 'T')
+  f.addSeq "\x1b[r"
 
 proc beginFrame*(o: var Out) {.inline.} =
   o.frame.setLen 0

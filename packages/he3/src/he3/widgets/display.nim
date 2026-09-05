@@ -9,28 +9,65 @@ type TextAlign* = enum
   textCenter
   textEnd
 
-func cellWidth*(value: string): int =
-  ## Measures a safe UTF-8 string in terminal cells.
-  for cluster in value.graphemes:
-    result += cluster.clusterWidth
+type CellFit = object
+  ## The longest prefix of a text that fits a cell budget.
+  stop: int
+  width: int
+  truncated: bool
+
+func cellWidth*(value: openArray[char]): int =
+  ## Measures safe UTF-8 text in terminal cells without allocating.
+  textWidth(value)
+
+func fitCells(value: openArray[char], width: int, ellipsis: bool): CellFit =
+  ## Finds the prefix of `value` that fits `width` cells. When the text does
+  ## not fit and `ellipsis` is set, one cell is reserved for the marker and
+  ## `width` includes it.
+  if width <= 0:
+    return CellFit(truncated: value.len > 0)
+  let reserve = if ellipsis: 1 else: 0
+  var used = 0
+  var keep = -1
+  var keepWidth = 0
+  for span in value.graphemeSpans:
+    let clusterWidth = clusterWidth(value.toOpenArray(span.a, span.b))
+    if keep < 0 and used + clusterWidth > width - reserve:
+      keep = span.a
+      keepWidth = used
+    if used + clusterWidth > width:
+      return CellFit(stop: keep, width: keepWidth + reserve, truncated: true)
+    inc used, clusterWidth
+  CellFit(stop: value.len, width: used)
 
 func truncateCells*(value: string, width: int,
     ellipsis = true): string =
   ## Clips at grapheme boundaries. A single U+2026 advertises hidden content.
   if width <= 0:
     return ""
-  if value.cellWidth <= width:
+  let fit = fitCells(value, width, ellipsis)
+  if not fit.truncated:
     return value
-  let reserve = if ellipsis: 1 else: 0
-  var used = 0
-  for cluster in value.graphemes:
-    let clusterWidth = cluster.clusterWidth
-    if used + clusterWidth > width - reserve:
-      break
-    result.add cluster
-    inc used, clusterWidth
+  result = value[0 ..< fit.stop]
   if ellipsis:
     result.add "…"
+
+proc writePrefix(frame: Frame, x, y: int, value: openArray[char],
+    fit: CellFit, style: Style, ellipsis: bool) =
+  if fit.stop > 0:
+    frame.write(x, y, value.toOpenArray(0, fit.stop - 1), style)
+  if fit.truncated and ellipsis and fit.width > 0:
+    frame.write(x + fit.width - 1, y, "…", style)
+
+proc writeFit*(frame: Frame, x, y: int, value: openArray[char], width: int,
+    style: Style, ellipsis = true): int =
+  ## Writes the prefix of `value` that fits `width` cells, clipping at
+  ## grapheme boundaries with an optional ellipsis, and returns the cells
+  ## used. Nothing is copied.
+  if width <= 0:
+    return 0
+  let fit = fitCells(value, width, ellipsis)
+  frame.writePrefix(x, y, value, fit, style, ellipsis)
+  fit.width
 
 func alignedX(width, contentWidth: int, align: TextAlign): int =
   case align
@@ -41,43 +78,53 @@ func alignedX(width, contentWidth: int, align: TextAlign): int =
 proc text*(frame: Frame, value: string, style = styleDefault(),
     align = textStart, ellipsis = false) =
   ## Renders one grapheme-safe line with optional alignment and ellipsis.
-  let shown = value.truncateCells(frame.rect.width, ellipsis)
-  frame.write(alignedX(frame.rect.width, shown.cellWidth, align), 0,
-    shown, style)
+  if frame.rect.width <= 0:
+    return
+  let fit = fitCells(value, frame.rect.width, ellipsis)
+  frame.writePrefix(alignedX(frame.rect.width, fit.width, align), 0, value,
+    fit, style, ellipsis)
 
 proc richText*(frame: Frame, value: Text, scroll = 0,
     wrap = true, align = textStart) =
   ## Renders styled spans with explicit lines and grapheme-aware wrapping.
   ## The full `Text` remains application-owned, so truncated content can be
-  ## exposed by a scroll/expanded view.
+  ## exposed by a scroll/expanded view. Only visible rows are written and
+  ## no text is copied.
   if frame.rect.isEmpty:
     return
-  type StyledCluster = tuple[value: string, style: Style]
-  var rows: seq[seq[StyledCluster]]
-  for line in value.lines:
-    var row: seq[StyledCluster]
-    var used = 0
-    for span in line.spans:
-      for cluster in span.text.graphemes:
-        let width = cluster.clusterWidth
+  type Piece = tuple[line, span, a, b, x: int]
+  let first = max(0, scroll)
+  let last = first + frame.rect.height
+  var row: seq[Piece]
+  var rowIndex = 0
+  var used = 0
+  template flushRow() =
+    if rowIndex >= first and rowIndex < last:
+      let offset = alignedX(frame.rect.width, used, align)
+      for piece in row:
+        let span = value.lines[piece.line].spans[piece.span]
+        frame.write(offset + piece.x, rowIndex - first,
+          span.text.toOpenArray(piece.a, piece.b), span.style)
+    row.setLen 0
+    inc rowIndex
+    used = 0
+  for lineIndex, line in value.lines:
+    if rowIndex >= last:
+      return
+    for spanIndex, span in line.spans:
+      for cluster in span.text.graphemeSpans:
+        let width = clusterWidth(span.text.toOpenArray(cluster.a, cluster.b))
         if wrap and used > 0 and used + width > frame.rect.width:
-          rows.add move(row)
-          row = @[]
-          used = 0
-        if width <= frame.rect.width:
-          row.add (cluster, span.style)
-          inc used, width
-    rows.add move(row)
-  let first = clamp(max(0, scroll), 0, rows.len)
-  let last = min(rows.len, first + frame.rect.height)
-  for rowIndex in first ..< last:
-    var rowWidth = 0
-    for cluster in rows[rowIndex]:
-      inc rowWidth, cluster.value.clusterWidth
-    var x = alignedX(frame.rect.width, rowWidth, align)
-    for cluster in rows[rowIndex]:
-      frame.write(x, rowIndex - first, cluster.value, cluster.style)
-      inc x, cluster.value.clusterWidth
+          flushRow()
+        if width <= 0 or width > frame.rect.width:
+          continue
+        if row.len > 0 and row[^1].line == lineIndex and
+            row[^1].span == spanIndex and row[^1].b + 1 == cluster.a:
+          row[^1].b = cluster.b
+        else:
+          row.add (lineIndex, spanIndex, cluster.a, cluster.b, used)
+        inc used, width
+    flushRow()
 
 proc `block`*(frame: Frame, title = "", style = styleDefault(),
     rounded = false): Frame =

@@ -16,6 +16,7 @@ type
     markdown: MarkdownState
     streaming: bool
     fedBytes: int
+    rewrites: uint64
     lineRows: seq[int]
     stableMeasured: int
     stableRows: int
@@ -35,6 +36,8 @@ type
     revision: uint64
     width: int
     topControl, bottomControl: Rect
+    drawnRect: Rect
+    drawnOffsetY: int
 
 const
   itemGap = 1
@@ -69,32 +72,40 @@ func trimmedEnd(value: string): int =
   while result > 0 and value[result - 1] == '\n':
     dec result
 
+func measureRuns(value: openArray[char], width: int, used, rows: var int) =
+  ## Advances the wrap cursor over `value`: printable ASCII runs advance in
+  ## bulk, everything else per cluster, matching `drawWrapped` exactly.
+  for run in value.textRuns:
+    if run.ascii:
+      var remaining = run.b - run.a + 1
+      while remaining > 0:
+        if used >= width:
+          inc rows
+          used = 0
+        let take = min(remaining, width - used)
+        inc used, take
+        dec remaining, take
+      continue
+    let clusterWidth = clusterWidth(value.toOpenArray(run.a, run.b))
+    if used > 0 and used + clusterWidth > width:
+      inc rows
+      used = 0
+    if clusterWidth <= width:
+      inc used, clusterWidth
+
 func rowsFor(value: openArray[char], width: int): int =
   ## Visual rows of one logical line, wrapped exactly as `drawLine` draws.
   if width <= 0: return 0
   result = 1
   var used = 0
-  for cluster in value.graphemeSpans:
-    let clusterWidth = clusterWidth(value.toOpenArray(cluster.a, cluster.b))
-    if used > 0 and used + clusterWidth > width:
-      inc result
-      used = 0
-    if clusterWidth <= width:
-      inc used, clusterWidth
+  value.measureRuns(width, used, result)
 
 func lineHeight(line: Line, width: int): int =
   if width <= 0: return 0
   result = 1
   var used = 0
   for span in line.spans:
-    for cluster in span.text.graphemeSpans:
-      let clusterWidth = clusterWidth(
-        span.text.toOpenArray(cluster.a, cluster.b))
-      if used > 0 and used + clusterWidth > width:
-        inc result
-        used = 0
-      if clusterWidth <= width:
-        inc used, clusterWidth
+    span.text.measureRuns(width, used, result)
 
 iterator contentLines(content: string): tuple[start, stop: int] =
   let finish = content.trimmedEnd
@@ -105,9 +116,19 @@ iterator contentLines(content: string): tuple[start, stop: int] =
     yield (start, stop)
     start = stop + 1
 
-func hasPrefix(value, prefix: string, length: int): bool =
-  if length > value.len or length > prefix.len: return false
-  length == 0 or cmpMem(unsafeAddr value[0], unsafeAddr prefix[0], length) == 0
+func containsIgnoreCase(value, needle: string): bool =
+  ## ASCII case-insensitive search that never copies `value`.
+  if needle.len == 0: return true
+  if needle.len > value.len: return false
+  let first = needle[0].toLowerAscii
+  for start in 0 .. value.len - needle.len:
+    if value[start].toLowerAscii != first: continue
+    var index = 1
+    while index < needle.len and
+        value[start + index].toLowerAscii == needle[index]:
+      inc index
+    if index == needle.len: return true
+  false
 
 proc measureLines(entry: var TranscriptCacheEntry, lines: seq[Line],
     stable, width: int): int =
@@ -152,18 +173,18 @@ proc rebuildMessage(entry: var TranscriptCacheEntry, item: TranscriptItem,
     bodyRows = entry.measureLines(entry.document.lines, 0, bodyWidth)
   else:
     let appended = entry.streaming and sameLayout and
-      item.content.len >= entry.fedBytes and
-      item.content.hasPrefix(entry.markdown.source, entry.fedBytes)
+      entry.rewrites == item.rewrites and item.content.len >= entry.fedBytes
     if appended:
       if item.content.len > entry.fedBytes:
-        entry.markdown.feed(item.content[entry.fedBytes ..< item.content.len],
-          theme)
+        entry.markdown.feed(item.content.toOpenArray(entry.fedBytes,
+          item.content.len - 1), theme)
     else:
       entry.markdown = initMarkdownState(maxBytes = unboundedMarkdown)
       entry.markdown.feed(item.content, theme)
       entry.stableMeasured = 0
       entry.stableRows = 0
     entry.fedBytes = item.content.len
+    entry.rewrites = item.rewrites
     entry.streaming = true
     if not sameLayout:
       entry.stableMeasured = 0
@@ -243,7 +264,7 @@ proc syncLayout*(state: var TranscriptState, chat: AgentChat,
   else:
     firstChanged = min(firstChanged, chat.items.len)
   for index in firstChanged ..< chat.items.len:
-    let item = chat.items[index]
+    template item: TranscriptItem = chat.items[index]
     if state.cache[index].id != item.id or
         state.cache[index].version != item.version or
         state.cache[index].width != safeWidth:
@@ -327,9 +348,9 @@ proc setSearch*(state: var TranscriptState, chat: AgentChat, query: string) =
   if state.search.len == 0: return
   let needle = state.search.toLowerAscii
   for index, item in chat.items:
-    if (needle in item.content.toLowerAscii) or
-        (needle in item.title.toLowerAscii) or
-        (needle in item.detail.toLowerAscii):
+    if item.content.containsIgnoreCase(needle) or
+        item.title.containsIgnoreCase(needle) or
+        item.detail.containsIgnoreCase(needle):
       state.matches.add index
 
 proc jumpToMatch*(state: var TranscriptState, forward = true): bool =
@@ -352,48 +373,61 @@ func selectedText*(state: TranscriptState, chat: AgentChat): string =
   else:
     ""
 
-proc drawSegment(frame: Frame, x, y: int, value: string, a, b: int,
-    style: Style) =
-  if b > a and y >= 0 and y < frame.rect.height:
-    frame.write(x, y, value[a ..< b], style)
-
-proc drawLine(frame: Frame, line: Line, skip: var int, y: var int) =
-  ## Draws one logical line wrapped to the frame width, omitting the first
-  ## `skip` visual rows. Wrapping matches `lineHeight` cluster for cluster.
+proc drawWrapped(frame: Frame, text: openArray[char], style: Style,
+    used, row: var int, skip, y: int) =
+  ## Draws one span's clusters continuing at column `used` of visual row
+  ## `row`, wrapping exactly like `lineHeight` and omitting rows before
+  ## `skip`. Each cluster is measured once and written directly.
   let width = frame.rect.width
-  var used = 0
-  var row = 0
-  for span in line.spans:
-    var segmentStart = 0
-    var segmentX = used
-    for cluster in span.text.graphemeSpans:
-      let clusterWidth = clusterWidth(
-        span.text.toOpenArray(cluster.a, cluster.b))
-      if used > 0 and used + clusterWidth > width:
+  if width <= 0:
+    return
+  for run in text.textRuns:
+    if run.ascii:
+      var start = run.a
+      while start <= run.b:
+        if used >= width:
+          inc row
+          used = 0
+        let take = min(run.b - start + 1, width - used)
         if row >= skip:
-          frame.drawSegment(segmentX, y + row - skip, span.text,
-            segmentStart, cluster.a, span.style)
-        inc row
-        used = 0
-        segmentStart = cluster.a
-        segmentX = 0
-      if clusterWidth <= width:
-        inc used, clusterWidth
-      else:
-        if row >= skip:
-          frame.drawSegment(segmentX, y + row - skip, span.text,
-            segmentStart, cluster.a, span.style)
-        segmentStart = cluster.b + 1
-        segmentX = used
-    if row >= skip:
-      frame.drawSegment(segmentX, y + row - skip, span.text, segmentStart,
-        span.text.len, span.style)
-  let rows = row + 1
+          frame.writeAsciiRun(used, y + row - skip,
+            text.toOpenArray(start, start + take - 1), style)
+        inc used, take
+        inc start, take
+      continue
+    let clusterWidth = clusterWidth(text.toOpenArray(run.a, run.b))
+    if used > 0 and used + clusterWidth > width:
+      inc row
+      used = 0
+    if clusterWidth <= width:
+      if row >= skip:
+        frame.writeCluster(used, y + row - skip,
+          text.toOpenArray(run.a, run.b), clusterWidth, style)
+      inc used, clusterWidth
+
+proc finishRows(rows: int, skip: var int, y: var int) =
   if skip >= rows:
     dec skip, rows
   else:
     inc y, rows - skip
     skip = 0
+
+proc drawLine(frame: Frame, line: Line, skip: var int, y: var int) =
+  ## Draws one logical line wrapped to the frame width, omitting the first
+  ## `skip` visual rows. Wrapping matches `lineHeight` cluster for cluster.
+  var used = 0
+  var row = 0
+  for span in line.spans:
+    frame.drawWrapped(span.text, span.style, used, row, skip, y)
+  finishRows(row + 1, skip, y)
+
+proc drawText(frame: Frame, text: openArray[char], style: Style,
+    skip: var int, y: var int) =
+  ## Draws one single-style logical line the same way `drawLine` does.
+  var used = 0
+  var row = 0
+  frame.drawWrapped(text, style, used, row, skip, y)
+  finishRows(row + 1, skip, y)
 
 proc drawLines(frame: Frame, lines: seq[Line], rows: seq[int],
     skip: var int, y: var int) =
@@ -449,8 +483,8 @@ proc drawToolOutput(frame: Frame, item: TranscriptItem,
     if skip >= rows:
       dec skip, rows
       continue
-    let line = item.content[span.start ..< span.stop]
     if diff:
+      let line = item.content[span.start ..< span.stop]
       let styled = line.diffStyle(colors)
       let text = if line.len > 0 and line[0] in {'+', '-'}:
         line[1 ..< line.len] else: line
@@ -458,8 +492,8 @@ proc drawToolOutput(frame: Frame, item: TranscriptItem,
         body.rect.width, true), styled.style)
       inc y
     else:
-      body.drawLine(Line(spans: @[Span(text: line, style: codeStyle)]),
-        skip, y)
+      body.drawText(item.content.toOpenArray(span.start, span.stop - 1),
+        codeStyle, skip, y)
 
 proc drawPlain(frame: Frame, item: TranscriptItem,
     entry: TranscriptCacheEntry, skipRows: int, colors: AgentTheme) =
@@ -478,8 +512,8 @@ proc drawPlain(frame: Frame, item: TranscriptItem,
     if skip >= rows:
       dec skip, rows
       continue
-    frame.drawLine(Line(spans: @[Span(
-      text: item.content[span.start ..< span.stop], style: style)]), skip, y)
+    frame.drawText(item.content.toOpenArray(span.start, span.stop - 1),
+      style, skip, y)
 
 proc drawScrollControl(frame: Frame, y: int, top: bool,
     colors: AgentTheme): Rect =
@@ -518,12 +552,18 @@ proc transcript*(outer: Frame, chat: AgentChat,
   if chat.items.len == 0:
     frame.write(0, 0, "No messages yet", colors.base.muted)
     return
+  if frame.rect == state.drawnRect and
+      state.scroll.offsetY != state.drawnOffsetY:
+    frame.hintScroll(state.scroll.offsetY - state.drawnOffsetY)
+  state.drawnRect = frame.rect
+  state.drawnOffsetY = state.scroll.offsetY
   let first = state.itemAtOffset(state.scroll.offsetY)
   var index = first
   while index < chat.items.len:
     let top = state.offsets[index] - state.scroll.offsetY
     if top >= frame.rect.height: break
-    let item = chat.items[index]
+    let current = index
+    template item: TranscriptItem = chat.items[current]
     let bodyRows = state.cache[index].bodyRows
     let skip = max(0, -top)
     let drawTop = max(0, top)

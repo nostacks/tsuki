@@ -20,6 +20,8 @@ type ParseState* = object
   kittyFlags*: int
   kittySeen*: bool
   deviceAttributesSeen*: bool
+  syncOutputSeen*: bool
+  syncOutputMode*: int
 
 func initParseState*(maxSequenceBytes = defaultMaxSequenceBytes,
     maxPasteBytes = defaultMaxPasteBytes): ParseState =
@@ -43,6 +45,11 @@ func pending*(s: ParseState): int =
 func kittySupported*(s: ParseState): bool =
   ## True after a kitty keyboard query reply with disambiguate support.
   s.kittySeen and (s.kittyFlags and 1) != 0
+
+func syncOutputSupported*(s: ParseState): bool =
+  ## True after a DECRQM reply reporting synchronized output (mode 2026) as
+  ## set or reset; an unrecognized or permanently reset mode reports false.
+  s.syncOutputSeen and s.syncOutputMode in {1, 2, 3}
 
 func deadlineMs*(s: ParseState, now = getMonoTime()): int =
   ## Milliseconds until an incomplete escape sequence must resolve, or -1
@@ -92,7 +99,7 @@ proc feedByte(state: var ParseState, b: byte): bool =
     state.discardSequence = true
     return false
   state.buf.add b
-  if state.buf.len == 1:
+  if state.buf.len == 1 and not state.paste and (b == 0x1b or b >= 0x80):
     state.t0 = getMonoTime()
   true
 
@@ -441,6 +448,17 @@ proc parseComplete(state: var ParseState, events: var seq[Event]): bool =
       of 'c':
         state.deviceAttributesSeen = true
         state.take(i + 1)
+        return true
+      of '$':
+        if i + 1 >= state.buf.len:
+          return false
+        if char(state.buf[i + 1]) == 'y':
+          var hasQ = false
+          let params = parseParams(state.buf.toOpenArray(2, i - 1), hasQ)
+          if hasQ and params.len >= 2 and params[0].main == 2026:
+            state.syncOutputSeen = true
+            state.syncOutputMode = params[1].main
+        state.take(i + 2)
         return true
       else:
         return false

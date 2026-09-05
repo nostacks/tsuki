@@ -39,18 +39,37 @@ func initTextareaState*(content = "", maxUndo = 100): TextareaState =
   TextareaState(content: sanitizeText(content), selectionAnchor: -1,
     preferredColumn: -1, maxUndo: max(1, maxUndo), historyIndex: -1)
 
-func clusters(value: string): seq[string] =
-  for cluster in value.graphemes:
-    result.add cluster
+type Cluster = Slice[int]
+  ## Inclusive byte range of one grapheme cluster inside the content.
+
+func clusters(value: string): seq[Cluster] =
+  for span in value.graphemeSpans:
+    result.add span
 
 func clusterCount(value: string): int =
-  for unused in value.graphemes: inc result
+  for unused in value.graphemeSpans: inc result
+
+func isNewline(value: string, cluster: Cluster): bool {.inline.} =
+  cluster.a == cluster.b and value[cluster.a] == '\n'
+
+func width(value: string, cluster: Cluster): int {.inline.} =
+  clusterWidth(value.toOpenArray(cluster.a, cluster.b))
+
+func startsWithSpace(value: string, cluster: Cluster): bool {.inline.} =
+  value.runeAt(cluster.a).isWhiteSpace
+
+func byteAt(value: string, items: openArray[Cluster], index: int): int =
+  ## Byte offset where cluster `index` starts, or the length past the end.
+  if index < items.len: items[index].a else: value.len
 
 func splice(value: string, first, last: int, insertion: string): string =
   let items = value.clusters
-  for index in 0 ..< clamp(first, 0, items.len): result.add items[index]
+  let a = value.byteAt(items, clamp(first, 0, items.len))
+  let b = max(a, value.byteAt(items, clamp(last, 0, items.len)))
+  result = newStringOfCap(a + insertion.len + value.len - b)
+  result.addChars value.toOpenArray(0, a - 1)
   result.add insertion
-  for index in clamp(last, 0, items.len) ..< items.len: result.add items[index]
+  result.addChars value.toOpenArray(b, value.len - 1)
 
 func hasSelection*(state: TextareaState): bool =
   ## True when anchor and cursor delimit a nonempty range.
@@ -67,8 +86,10 @@ func selectedText*(state: TextareaState): string =
   ## Returns the selected safe text for an explicit host copy action.
   let selection = state.selectionRange
   let items = state.content.clusters
-  for index in selection.first ..< selection.last:
-    if index >= 0 and index < items.len: result.add items[index]
+  let a = state.content.byteAt(items, clamp(selection.first, 0, items.len))
+  let b = state.content.byteAt(items, clamp(selection.last, 0, items.len))
+  if b > a:
+    result = state.content[a ..< b]
 
 proc push(history: var SnapshotHistory, snapshot: sink EditSnapshot,
     capacity: int) =
@@ -128,28 +149,32 @@ proc replaceSelection(state: var TextareaState, insertion: string) =
   state.cursor = selection.first + safe.clusterCount
   state.selectionAnchor = -1
 
-func lineColumn(items: openArray[string], cursor: int): tuple[row, column: int] =
+func lineColumn(value: string, items: openArray[Cluster],
+    cursor: int): tuple[row, column: int] =
   for index in 0 ..< min(cursor, items.len):
-    if items[index] == "\n":
+    if value.isNewline(items[index]):
       inc result.row
       result.column = 0
     else:
-      inc result.column, items[index].clusterWidth
+      inc result.column, value.width(items[index])
 
-func indexAt(items: openArray[string], wantedRow, wantedColumn: int): int =
+func indexAt(value: string, items: openArray[Cluster],
+    wantedRow, wantedColumn: int): int =
   var row = 0
   var column = 0
   for index, cluster in items:
-    if row == wantedRow and (column >= wantedColumn or cluster == "\n"):
+    let newline = value.isNewline(cluster)
+    if row == wantedRow and (column >= wantedColumn or newline):
       return index
-    if cluster == "\n":
+    if newline:
       if row == wantedRow: return index
       inc row
       column = 0
     else:
-      if row == wantedRow and column + cluster.clusterWidth > wantedColumn:
+      let clusterWidth = value.width(cluster)
+      if row == wantedRow and column + clusterWidth > wantedColumn:
         return index
-      inc column, cluster.clusterWidth
+      inc column, clusterWidth
   items.len
 
 proc prepareSelection(state: var TextareaState, shift: bool, oldCursor: int) =
@@ -212,8 +237,10 @@ proc textareaEvent*(state: var TextareaState, event: Event,
       state.remember()
       if not state.deleteSelection() and state.cursor > 0:
         var cut = state.cursor
-        while cut > 0 and items[cut - 1].runeAt(0).isWhiteSpace: dec cut
-        while cut > 0 and not items[cut - 1].runeAt(0).isWhiteSpace: dec cut
+        while cut > 0 and state.content.startsWithSpace(items[cut - 1]):
+          dec cut
+        while cut > 0 and not state.content.startsWithSpace(items[cut - 1]):
+          dec cut
         state.content = splice(state.content, cut, state.cursor, "")
         state.cursor = cut
       state.selectionAnchor = -1
@@ -245,32 +272,34 @@ proc textareaEvent*(state: var TextareaState, event: Event,
   case key.code
   of kcLeft:
     if ctrl:
-      while state.cursor > 0 and items[state.cursor - 1].runeAt(0).isWhiteSpace:
+      while state.cursor > 0 and
+          state.content.startsWithSpace(items[state.cursor - 1]):
         dec state.cursor
-      while state.cursor > 0 and not items[state.cursor - 1].runeAt(
-          0).isWhiteSpace:
+      while state.cursor > 0 and
+          not state.content.startsWithSpace(items[state.cursor - 1]):
         dec state.cursor
     else: state.cursor = max(0, state.cursor - 1)
   of kcRight:
     if ctrl:
-      while state.cursor < items.len and not items[state.cursor].runeAt(
-          0).isWhiteSpace:
+      while state.cursor < items.len and
+          not state.content.startsWithSpace(items[state.cursor]):
         inc state.cursor
-      while state.cursor < items.len and items[state.cursor].runeAt(
-          0).isWhiteSpace:
+      while state.cursor < items.len and
+          state.content.startsWithSpace(items[state.cursor]):
         inc state.cursor
     else: state.cursor = min(items.len, state.cursor + 1)
   of kcUp, kcDown:
-    let position = lineColumn(items, state.cursor)
+    let position = state.content.lineColumn(items, state.cursor)
     if state.preferredColumn < 0: state.preferredColumn = position.column
     let targetRow = max(0, position.row + (if key.code == kcUp: -1 else: 1))
-    state.cursor = indexAt(items, targetRow, state.preferredColumn)
+    state.cursor = state.content.indexAt(items, targetRow,
+      state.preferredColumn)
   of kcHome:
-    let position = lineColumn(items, state.cursor)
-    state.cursor = indexAt(items, position.row, 0)
+    let position = state.content.lineColumn(items, state.cursor)
+    state.cursor = state.content.indexAt(items, position.row, 0)
   of kcEnd:
-    let position = lineColumn(items, state.cursor)
-    state.cursor = indexAt(items, position.row, high(int))
+    let position = state.content.lineColumn(items, state.cursor)
+    state.cursor = state.content.indexAt(items, position.row, high(int))
   of kcBackspace:
     if readOnly: return taIgnored
     if not state.hasSelection and state.cursor <= 0: return taIgnored
@@ -296,7 +325,7 @@ proc positionCursor*(state: var TextareaState, row, column: int,
   ## Positions the cursor from a mouse-derived logical row/cell column.
   let items = state.content.clusters
   let previous = state.cursor
-  state.cursor = indexAt(items, max(0, row), max(0, column))
+  state.cursor = state.content.indexAt(items, max(0, row), max(0, column))
   state.prepareSelection(extendSelection, previous)
 
 proc textarea*(frame: Frame, state: var TextareaState, focused = true,
@@ -308,16 +337,16 @@ proc textarea*(frame: Frame, state: var TextareaState, focused = true,
   if frame.rect.isEmpty: return
   let items = state.content.clusters
   state.cursor = clamp(state.cursor, 0, items.len)
-  let cursorPosition = lineColumn(items, state.cursor)
+  let cursorPosition = state.content.lineColumn(items, state.cursor)
   var rowCount = 1
   var maxWidth = 0
   var rowWidth = 0
   for cluster in items:
-    if cluster == "\n":
+    if state.content.isNewline(cluster):
       maxWidth = max(maxWidth, rowWidth)
       rowWidth = 0
       inc rowCount
-    else: inc rowWidth, cluster.clusterWidth
+    else: inc rowWidth, state.content.width(cluster)
   maxWidth = max(maxWidth, rowWidth + 1)
   state.scroll.update(frame.rect.width, frame.rect.height, maxWidth, rowCount)
   if cursorPosition.row < state.scroll.offsetY:
@@ -334,8 +363,8 @@ proc textarea*(frame: Frame, state: var TextareaState, focused = true,
     frame.write(0, 0, shown, colors.muted)
     if focused:
       var cursorGlyph = " "
-      for cluster in shown.graphemes:
-        cursorGlyph = cluster
+      for span in shown.graphemeSpans:
+        cursorGlyph = shown[span]
         break
       frame.write(0, 0, cursorGlyph, colors.focus)
     return
@@ -343,24 +372,34 @@ proc textarea*(frame: Frame, state: var TextareaState, focused = true,
   var row = 0
   var column = 0
   for index, cluster in items:
-    if cluster == "\n":
+    if state.content.isNewline(cluster):
       inc row
       column = 0
       continue
-    let width = cluster.clusterWidth
+    let width = state.content.width(cluster)
     let screenY = row - state.scroll.offsetY
     let screenX = column - state.scroll.offsetX
     if screenY >= 0 and screenY < frame.rect.height and screenX >= 0 and
         screenX + width <= frame.rect.width:
-      let shown = if masked: "•" else: cluster
       let selected = index >= selection.first and index < selection.last
       let cellStyle = if selected: colors.selection else: colors.text
-      frame.write(screenX, screenY, shown, cellStyle)
+      if masked:
+        frame.write(screenX, screenY, "•", cellStyle)
+      else:
+        frame.write(screenX, screenY,
+          state.content.toOpenArray(cluster.a, cluster.b), cellStyle)
     inc column, width
   if focused:
     let x = cursorPosition.column - state.scroll.offsetX
     let y = cursorPosition.row - state.scroll.offsetY
     if x >= 0 and x < frame.rect.width and y >= 0 and y < frame.rect.height:
-      let under = if state.cursor < items.len and items[state.cursor] != "\n":
-        (if masked: "•" else: items[state.cursor]) else: " "
-      frame.write(x, y, under, colors.focus)
+      if state.cursor < items.len and
+          not state.content.isNewline(items[state.cursor]):
+        if masked:
+          frame.write(x, y, "•", colors.focus)
+        else:
+          let cluster = items[state.cursor]
+          frame.write(x, y, state.content.toOpenArray(cluster.a, cluster.b),
+            colors.focus)
+      else:
+        frame.write(x, y, " ", colors.focus)

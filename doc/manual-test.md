@@ -12,6 +12,7 @@ Evidence as of 2026-08-29:
 | Linux | source is POSIX-compatible | not recorded | Native run still required |
 | Windows amd64 | source has a native backend | not recorded | Native run still required |
 | SSH/tmux/screen | not recorded | not recorded | Compatibility is not yet claimed |
+| DECRQM 2026 probe and scroll-region diffs | headless replay and parser tests pass | not recorded | Terminal-side behavior of the probe reply and `DECSTBM`/`SU` scrolling still needs a real-terminal run |
 
 ## Agent demo checklist
 

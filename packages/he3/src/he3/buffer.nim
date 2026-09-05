@@ -19,6 +19,13 @@ type
     glyphOffset*: uint32
     glyphLen*: uint16
 
+  ScrollHint* = object
+    ## A renderer hint that the rows of `region` moved by `rows` since the
+    ## previous frame: positive values scrolled content up. The diff may use
+    ## terminal scrolling for the move; it never affects what is drawn.
+    region*: Rect
+    rows*: int
+
   Buffer* = object
     ## A rectangular cell grid and its reused complex-glyph arena.
     width*: int
@@ -26,6 +33,8 @@ type
     cells*: seq[Cell]
     glyphArena*: seq[byte]
     widthPolicy*: WidthPolicy
+    scrollHint*: ScrollHint
+    scrollHintConflict*: bool
 
 static:
   doAssert sizeof(Cell) <= 24, "Cell must stay cache-friendly"
@@ -84,8 +93,9 @@ func glyphBytesEqual(a: Buffer, ac: Cell, b: Buffer, bc: Cell): bool =
       return false
   true
 
-func sameCellUnchecked(a: Buffer, ac: Cell, b: Buffer,
+func sameCellUnchecked*(a: Buffer, ac: Cell, b: Buffer,
     bc: Cell): bool {.inline.} =
+  ## Compares two cells that belong to `a` and `b` without index checks.
   if ac.rune != bc.rune or ac.style != bc.style or
       ac.wideTail != bc.wideTail:
     return false
@@ -101,15 +111,21 @@ func sameCell*(a: Buffer, ai: int, b: Buffer, bi: int): bool =
     return false
   sameCellUnchecked(a, a.cells[ai], b, b.cells[bi])
 
-func sameRow*(a: Buffer, b: Buffer, y: int): bool =
-  ## Compares one full row of two equally wide buffers, glyph bytes included.
+func firstDifference*(a: Buffer, b: Buffer, y: int): int =
+  ## Returns the first column where row `y` differs between two equally wide
+  ## buffers, or the width when the rows match. Invalid rows differ at zero.
   if a.width != b.width or y < 0 or y >= a.height or y >= b.height:
-    return false
+    return 0
   let base = y * a.width
   for x in 0 ..< a.width:
     if not sameCellUnchecked(a, a.cells[base + x], b, b.cells[base + x]):
-      return false
-  true
+      return x
+  a.width
+
+func sameRow*(a: Buffer, b: Buffer, y: int): bool =
+  ## Compares one full row of two equally wide buffers, glyph bytes included.
+  a.width == b.width and y >= 0 and y < a.height and y < b.height and
+    a.firstDifference(b, y) == a.width
 
 func `==`*(a, b: Buffer): bool =
   ## Compares dimensions, styles, and grapheme content, independent of arena
@@ -224,6 +240,32 @@ proc storeCluster(b: var Buffer, x, y: int, cluster: openArray[char],
     b.cells[y * b.width + x + 1] = Cell(rune: tailRune, style: style,
       wideTail: true)
 
+proc writeAscii*(b: var Buffer, x, y: int, ch: char,
+    style = styleDefault()) {.inline.} =
+  ## Writes one printable ASCII cell, repairing any wide glyph it overlaps.
+  ## Callers guarantee bounds and that `ch` is in the printable range.
+  b.repairAt(x, y)
+  b.cells[y * b.width + x] = Cell(rune: Rune(ch), style: style,
+    displayWidth: 1)
+
+proc writeAsciiRun*(b: var Buffer, x, y: int, run: openArray[char],
+    style = styleDefault()) =
+  ## Writes printable ASCII bytes as consecutive one-cell glyphs, clipping to
+  ## the buffer and repairing wide glyphs cut at either end. Callers
+  ## guarantee every byte is in the printable range.
+  if y < 0 or y >= b.height or run.len == 0:
+    return
+  let first = max(0, x)
+  let last = min(b.width, x + run.len)
+  if first >= last:
+    return
+  b.repairAt(first, y)
+  b.repairAt(last - 1, y)
+  let base = y * b.width
+  for column in first ..< last:
+    b.cells[base + column] = Cell(rune: Rune(run[column - x]), style: style,
+      displayWidth: 1)
+
 proc writeCluster*(b: var Buffer, x, y: int, cluster: openArray[char],
     width: int, style = styleDefault()): int =
   ## Writes one already-sanitized, already-measured grapheme atomically and
@@ -233,7 +275,11 @@ proc writeCluster*(b: var Buffer, x, y: int, cluster: openArray[char],
   if result <= 0 or result > 2 or cluster.len == 0 or x < 0 or y < 0 or
       x >= b.width or y >= b.height or x + result > b.width:
     return 0
-  b.storeCluster(x, y, cluster, result, style)
+  if cluster.len == 1 and result == 1 and cluster[0] >= ' ' and
+      cluster[0] < '\x7F':
+    b.writeAscii(x, y, cluster[0], style)
+  else:
+    b.storeCluster(x, y, cluster, result, style)
 
 proc writeCluster*(b: var Buffer, x, y: int, cluster: string,
     style = styleDefault()): int =
@@ -281,11 +327,56 @@ proc writeStr*(b: var Buffer, x, y: int, value: string,
     b.writeSpans(x, y, safe.toOpenArray(0, safe.len - 1), style)
 
 proc reset*(b: var Buffer, style = styleDefault()) =
-  ## Clears every cell and reuses the complex-glyph arena capacity.
+  ## Clears every cell, drops any scroll hint, and reuses the complex-glyph
+  ## arena capacity.
   b.glyphArena.setLen 0
+  b.scrollHint = ScrollHint()
+  b.scrollHintConflict = false
   let blank = blankCell(style)
   for cell in b.cells.mitems:
     cell = blank
+
+proc hintScroll*(b: var Buffer, region: Rect, rows: int) =
+  ## Records that `region` scrolled by `rows` since the previous frame. A
+  ## second, different hint in the same frame cancels both.
+  if rows == 0 or region.isEmpty:
+    return
+  if b.scrollHintConflict:
+    return
+  if b.scrollHint.rows != 0 and (b.scrollHint.region != region or
+      b.scrollHint.rows != rows):
+    b.scrollHint = ScrollHint()
+    b.scrollHintConflict = true
+    return
+  b.scrollHint = ScrollHint(region: region, rows: rows)
+
+proc scrollRows*(b: var Buffer, top, height, rows: int) =
+  ## Moves full rows `top ..< top + height` by `rows` (positive is up) and
+  ## blanks the rows exposed by the move, mirroring a terminal scroll inside
+  ## a top/bottom margin region.
+  if rows == 0 or height <= 0 or top < 0 or top + height > b.height:
+    return
+  let count = min(abs(rows), height)
+  let width = b.width
+  let blank = defaultCell()
+  if rows > 0:
+    for y in top ..< top + height - count:
+      let dest = y * width
+      let source = (y + count) * width
+      for x in 0 ..< width:
+        b.cells[dest + x] = b.cells[source + x]
+    for y in top + height - count ..< top + height:
+      for x in 0 ..< width:
+        b.cells[y * width + x] = blank
+  else:
+    for y in countdown(top + height - 1, top + count):
+      let dest = y * width
+      let source = (y - count) * width
+      for x in 0 ..< width:
+        b.cells[dest + x] = b.cells[source + x]
+    for y in top ..< top + count:
+      for x in 0 ..< width:
+        b.cells[y * width + x] = blank
 
 proc copyCellFrom(dest: var Buffer, dx, dy: int, source: Buffer,
     cell: Cell) =

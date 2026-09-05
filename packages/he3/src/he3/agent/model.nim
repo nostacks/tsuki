@@ -115,10 +115,14 @@ type
     title*: string
     detail*: string
     content*: string
+      ## Sanitized body. Events only ever append to it, and the transcript
+      ## view relies on that to keep its incremental Markdown state; hosts
+      ## that replace it must bump `rewrites`.
     language*: string
     status*: ToolStatus
     expanded*: bool
     version*: uint64
+    rewrites*: uint64
     startedAtMs*: int64
     finishedAtMs*: int64
     citations*: seq[Citation]
@@ -521,10 +525,11 @@ proc changesSince*(chat: AgentChat, revision: uint64,
   let oldest = chat.changes[chat.changeStart].revision
   if revision + 1 < oldest:
     return false
-  for offset in 0 ..< chat.changeCount:
+  for offset in countdown(chat.changeCount - 1, 0):
     let change = chat.changes[(chat.changeStart + offset) mod chat.changes.len]
-    if change.revision > revision:
-      firstChanged = min(firstChanged, change.index)
+    if change.revision <= revision:
+      break
+    firstChanged = min(firstChanged, change.index)
   true
 
 proc toggleExpanded*(chat: AgentChat, index: int): bool =
@@ -584,7 +589,9 @@ proc apply*(chat: AgentChat, event: AgentEvent) =
       index = chat.items.len - 1
     let remaining = max(0, chat.maxMessageBytes -
       chat.items[index].content.len)
-    if remaining > 0:
+    if safeText.len <= remaining:
+      chat.items[index].content.add safeText
+    elif remaining > 0:
       chat.items[index].content.add sanitizeText(safeText,
         plainTextPolicy(maxBytes = remaining))
     if safeText.len > remaining and not chat.items[index].content.endsWith(

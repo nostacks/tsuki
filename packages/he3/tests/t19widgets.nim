@@ -75,6 +75,63 @@ proc testTextareaAndWidgets =
   check "0%" in nonFinite.snapshot and ".???@" in nonFinite.snapshot,
     "progress and charts render non-finite host data without defects"
 
+proc referenceTruncate(value: string, width: int, ellipsis: bool): string =
+  if width <= 0: return ""
+  if value.cellWidth <= width: return value
+  let reserve = if ellipsis: 1 else: 0
+  var used = 0
+  for cluster in value.graphemes:
+    let clusterWidth = cluster.clusterWidth
+    if used + clusterWidth > width - reserve: break
+    result.add cluster
+    inc used, clusterWidth
+  if ellipsis: result.add "…"
+
+proc testTextFitting =
+  let samples = ["", "abc", "你好世界", "a👨‍👩‍👧b",
+    "e\u0301 accent",
+    "wide 終端 mix", "x".repeat(50), "tab\tstop", "🇺🇸 flag"]
+  for sample in samples:
+    for width in -1 .. 14:
+      for ellipsis in [true, false]:
+        check sample.truncateCells(width, ellipsis) ==
+          referenceTruncate(sample, width, ellipsis),
+          "truncateCells matches the allocating reference for " & sample &
+          " at " & $width
+  check "你好".cellWidth == 4 and "".cellWidth == 0, "cellWidth measures cells"
+  var harness = initHeadlessTui(10, 4)
+  var used = 0
+  harness.draw proc (frame: var Frame) =
+    frame.sub(rect(0, 0, 10, 1)).text("hello world", align = textEnd,
+      ellipsis = true)
+    frame.sub(rect(0, 1, 10, 1)).text("hi", align = textCenter)
+    frame.sub(rect(0, 2, 10, 1)).text("hello world", align = textEnd)
+    used = frame.sub(rect(0, 3, 10, 1)).writeFit(1, 0, "abcdef", 4,
+      styleDefault())
+  check harness.snapshot == "hello wor…\n    hi\nhello worl\n abc…",
+    "text and writeFit clip at grapheme boundaries with alignment"
+  check used == 4, "writeFit reports the cells it used"
+
+proc testRichTextRows =
+  var styled = initText("")
+  styled.lines.setLen 0
+  var line = initLine(initSpan("hello", styleDefault().bold),
+    initSpan(" world"))
+  styled.add line
+  styled.add initLine(initSpan("tail"))
+  var narrow = initHeadlessTui(5, 2)
+  narrow.draw proc (frame: var Frame) =
+    frame.richText(styled, scroll = 1)
+  check narrow.snapshot == " worl\nd", "scrolled rows wrap per cluster"
+  var aligned = initHeadlessTui(6, 3)
+  aligned.draw proc (frame: var Frame) =
+    frame.richText(styled, align = textEnd)
+  check aligned.snapshot == "hello\n world\n  tail",
+    "end alignment positions every visible row"
+  check aligned.cells[0].style == styleDefault().bold and
+    aligned.cells[6 + 1].style == styleDefault(),
+    "span styles survive the row split"
+
 proc testMouseHelpers =
   let press = Event(kind: evMouse, mouse: MouseEvent(action: maPress,
     button: 0, x: 4, y: 7))
@@ -90,5 +147,7 @@ proc testMouseHelpers =
 
 testLayoutAndRouting()
 testTextareaAndWidgets()
+testTextFitting()
+testRichTextRows()
 testMouseHelpers()
 echo "widgets ok"

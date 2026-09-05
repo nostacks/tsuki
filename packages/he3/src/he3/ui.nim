@@ -17,7 +17,7 @@ const kittyEnableSeq = "\x1b[>1u"
 
 when defined(posix):
   const
-    kittyQuery = "\x1b[?u\x1b[c"
+    kittyQuery = "\x1b[?u\x1b[?2026$p\x1b[c"
     kittyProbeTimeoutMs = 100
 
 type Ui* = object
@@ -42,10 +42,10 @@ proc kittyEnable*(ui: var Ui) =
   ui.w.write kittyEnableSeq.toOpenArrayByte(0, kittyEnableSeq.len - 1)
 
 proc kittyProbe*(ui: var Ui) =
-  ## Queries kitty keyboard protocol support and enables it when the
-  ## terminal answers. The primary device attributes reply that follows the
-  ## query ends the wait early on terminals without the protocol; the probe
-  ## gives up after 100 ms otherwise. Skipped without a real terminal.
+  ## Queries kitty keyboard protocol and synchronized output support and
+  ## enables each when the terminal answers. The primary device attributes
+  ## reply that follows both queries ends the wait; the probe gives up after
+  ## 100 ms otherwise. Skipped without a real terminal.
   when defined(posix):
     if not ui.term.interactive:
       return
@@ -70,10 +70,12 @@ proc kittyProbe*(ui: var Ui) =
       if n <= 0:
         break
       ui.state.parse(buf.toOpenArray(0, int(n) - 1), ui.events)
-      if ui.state.kittySeen or ui.state.deviceAttributesSeen:
+      if ui.state.deviceAttributesSeen:
         break
   if ui.state.kittySupported():
     ui.kittyEnable()
+  if ui.state.syncOutputSeen:
+    ui.w.syncOutput = ui.state.syncOutputSupported()
 
 proc initUiWith*(o: sink Out, mouse = false, probe = false,
     maxPostedEvents = 4096, mode = tsmFullscreen): Ui =
@@ -111,7 +113,9 @@ proc initUi*(mouse = false, probe = true, maxPostedEvents = 4096,
   ## drawing into `back`. Synchronized output is enabled only for terminals
   ## that advertise it.
   var output = initOut(cint(1))
-  output.syncOutput = detectCapabilities().synchronizedOutput
+  let capabilities = detectCapabilities()
+  output.syncOutput = capabilities.synchronizedOutput
+  output.scrollRegions = capabilities.scrollRegions
   initUiWith(output, mouse, probe, maxPostedEvents, mode)
 
 proc leave*(ui: var Ui) =

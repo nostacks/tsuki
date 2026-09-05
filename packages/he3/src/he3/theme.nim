@@ -28,9 +28,7 @@ type
     focus*: Style
     disabled*: Style
 
-func darkTheme*(): Theme =
-  ## Dark theme using a neutral ramp, one violet interactive accent, and
-  ## distinct status hues.
+func buildDarkTheme(): Theme =
   let base = rgb(17, 19, 24)
   let surface = rgb(31, 35, 43)
   Theme(
@@ -49,8 +47,7 @@ func darkTheme*(): Theme =
     focus: fg(rgb(255, 255, 255)).withBg(rgb(94, 61, 153)).bold,
     disabled: fg(rgb(111, 117, 132)).withBg(base))
 
-func lightTheme*(): Theme =
-  ## Light theme with independently tuned surfaces and semantic roles.
+func buildLightTheme(): Theme =
   let base = rgb(250, 250, 252)
   let surface = rgb(239, 240, 245)
   Theme(
@@ -68,6 +65,20 @@ func lightTheme*(): Theme =
     diffRemove: fg(rgb(145, 28, 37)).withBg(rgb(252, 226, 228)),
     focus: fg(rgb(255, 255, 255)).withBg(rgb(91, 45, 155)).bold,
     disabled: fg(rgb(126, 131, 145)).withBg(base))
+
+const
+  darkThemeValue = buildDarkTheme()
+  lightThemeValue = buildLightTheme()
+
+func darkTheme*(): Theme {.inline.} =
+  ## Dark theme using a neutral ramp, one violet interactive accent, and
+  ## distinct status hues. Built once at compile time.
+  darkThemeValue
+
+func lightTheme*(): Theme {.inline.} =
+  ## Light theme with independently tuned surfaces and semantic roles. Built
+  ## once at compile time.
+  lightThemeValue
 
 func monochromeTheme*(): Theme =
   ## Attribute-led monochrome theme. Status remains redundant in widget text.

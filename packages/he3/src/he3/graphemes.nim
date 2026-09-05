@@ -172,6 +172,34 @@ iterator graphemeSpans*(value: openArray[char]): Slice[int] =
       previous = current
     yield start ..< offset
 
+iterator textRuns*(value: openArray[char]): tuple[a, b: int, ascii: bool] =
+  ## Iterates `value` as maximal runs of printable ASCII, each byte one cell
+  ## wide and never joined to a following scalar, interleaved with single
+  ## grapheme clusters for everything else. Hot paths use it to handle plain
+  ## text in bulk while keeping cluster boundaries exact.
+  var offset = 0
+  while offset < value.len:
+    let first = uint8(value[offset])
+    if first >= 0x20'u8 and first < 0x7F'u8:
+      var stop = offset
+      while stop < value.len:
+        let current = uint8(value[stop])
+        if current < 0x20'u8 or current >= 0x7F'u8:
+          break
+        let nextByte = if stop + 1 < value.len: uint8(value[stop + 1])
+          else: 0'u8
+        if nextByte >= 0x80'u8:
+          break
+        inc stop
+      if stop > offset:
+        yield (offset, stop - 1, true)
+        offset = stop
+        continue
+    for span in value.toOpenArray(offset, value.len - 1).graphemeSpans:
+      yield (offset + span.a, offset + span.b, false)
+      offset += span.len
+      break
+
 iterator graphemes*(value: string): string =
   ## Iterates Unicode 16 extended grapheme clusters as strings; prefer
   ## `graphemeSpans` on hot paths.
@@ -211,5 +239,12 @@ func clusterWidth*(cluster: string, policy = WidthPolicy()): int {.inline.} =
 
 func textWidth*(value: openArray[char], policy = WidthPolicy()): int =
   ## Measures safe UTF-8 text in terminal cells without allocating.
-  for span in value.graphemeSpans:
-    result += clusterWidth(value.toOpenArray(span.a, span.b), policy)
+  if policy.resolver.isNil:
+    for run in value.textRuns:
+      if run.ascii:
+        result += run.b - run.a + 1
+      else:
+        result += clusterWidth(value.toOpenArray(run.a, run.b), policy)
+  else:
+    for span in value.graphemeSpans:
+      result += clusterWidth(value.toOpenArray(span.a, span.b), policy)

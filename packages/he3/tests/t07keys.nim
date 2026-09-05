@@ -115,9 +115,38 @@ proc testHostileInput =
     events[0].text == "abcd…",
     "split paste terminators work and pasted bytes stay bounded"
 
+proc testModeReports =
+  var events: seq[Event]
+  var supported: ParseState
+  let reply = "\e[?2026;2$y"
+  supported.parse(reply.toOpenArrayByte(0, reply.len - 1), events)
+  check events.len == 0 and supported.syncOutputSupported,
+    "a DECRPM reply reporting mode 2026 reset means supported"
+  var unsupported: ParseState
+  let refused = "\e[?2026;0$y"
+  unsupported.parse(refused.toOpenArrayByte(0, refused.len - 1), events)
+  check unsupported.syncOutputSeen and not unsupported.syncOutputSupported,
+    "an unrecognized mode is reported as unsupported"
+  var other: ParseState
+  let unrelated = "\e[?1;1$yx"
+  other.parse(unrelated.toOpenArrayByte(0, unrelated.len - 1), events)
+  check not other.syncOutputSeen and events.len == 1 and
+    events[0].key.isChar('x'),
+    "other mode reports are consumed without hiding later input"
+  events.setLen 0
+  var split: ParseState
+  let head = "\e[?2026;1$"
+  split.parse(head.toOpenArrayByte(0, head.len - 1), events)
+  check split.pending > 0 and not split.syncOutputSeen,
+    "a split reply waits for its final byte"
+  split.parse([byte('y')], events)
+  check split.pending == 0 and split.syncOutputSupported and events.len == 0,
+    "the split reply resolves once complete"
+
 proc main =
   runCorpusFile("tests/corpora/legacy.txt")
   testHostileInput()
+  testModeReports()
   echo "keys ok"
 
 main()

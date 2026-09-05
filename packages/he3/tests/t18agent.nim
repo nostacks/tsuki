@@ -228,6 +228,40 @@ proc testTranscriptViewport =
     check harness.snapshot == fresh.snapshot,
       "the incremental document matches from the top as well"
 
+proc testTranscriptScrollHint =
+  let chat = initAgentChat()
+  chat.apply userMessage("t:user", "go")
+  var harness = initHeadlessTui(40, 6)
+  var state: TranscriptState
+  state.scroll.anchor = anchorEnd
+  for index in 0 ..< 12:
+    chat.apply messageDelta("t", "line " & $index & "\n")
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  check harness.buffer.scrollHint.rows == 0, "the first draw has no history"
+  for index in 12 ..< 15:
+    chat.apply messageDelta("t", "line " & $index & "\n")
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  check harness.buffer.scrollHint.rows == 3 and
+    harness.buffer.scrollHint.region == rect(0, 0, 40, 6),
+    "streaming at the end hints an upward scroll by the new rows"
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  check harness.buffer.scrollHint.rows == 0, "an unchanged view has no hint"
+  discard state.transcriptEvent(chat, Event(kind: evKey, key: initKey(kcUp)))
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  check harness.buffer.scrollHint.rows == -1, "scrolling up hints downward"
+  harness.resize(40, 8)
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  check harness.buffer.scrollHint.rows == 0, "a new viewport never hints"
+  state.setSearch(chat, "LINE 3")
+  check state.matches == @[1], "search is case-insensitive"
+  state.setSearch(chat, "missing")
+  check state.matches.len == 0, "search reports no false matches"
+
 proc testExplicitProtocols =
   var caps = monochromeCapabilities()
   let link = encodeHyperlink(Hyperlink(uri: "https://example.com"), "site", caps)
@@ -1276,6 +1310,7 @@ testStreamingMarkdown()
 testAgentModel()
 testTranscriptAndApproval()
 testTranscriptViewport()
+testTranscriptScrollHint()
 testAgentShell()
 testExplicitProtocols()
 testPhase1Views()

@@ -9,14 +9,39 @@ import he3/agent/[model, transcript]
 type Result = object
   name: string
   ms: float
+  allocs: int
+
+const rounds = 5
+
+proc allocations(): int =
+  ## Heap allocation count so far; zero unless built with -d:nimAllocStats.
+  ## The counter fields are private, so the rendered form is parsed.
+  let rendered = $getAllocStats()
+  let key = "allocCount: "
+  let start = rendered.find(key)
+  if start < 0:
+    return 0
+  var stop = start + key.len
+  while stop < rendered.len and rendered[stop].isDigit:
+    inc stop
+  parseInt(rendered[start + key.len ..< stop])
 
 proc measure(name: string, runs: int, body: proc ()): Result =
-  ## Times `body` averaged over `runs` invocations.
-  let start = getMonoTime()
-  for i in 0 ..< runs:
-    body()
-  let elapsed = (getMonoTime() - start).inNanoseconds.float / 1_000_000.0
-  Result(name: name, ms: elapsed / runs.float)
+  ## Times `body` averaged over `runs` invocations, keeping the fastest of
+  ## several rounds so scheduler noise cannot masquerade as a regression, and
+  ## reports the allocations of one invocation.
+  result = Result(name: name, ms: Inf)
+  for round in 0 ..< rounds:
+    let start = getMonoTime()
+    for i in 0 ..< runs:
+      body()
+    let elapsed = (getMonoTime() - start).inNanoseconds.float / 1_000_000.0
+    result.ms = min(result.ms, elapsed / runs.float)
+  let probeStart = allocations()
+  let overhead = allocations() - probeStart
+  let before = allocations()
+  body()
+  result.allocs = allocations() - before - overhead
 
 func filledBuffer(w, h: int): Buffer =
   result = initBuffer(w, h)
@@ -90,7 +115,7 @@ proc benchParser(): Result =
   var events: seq[Event]
   if corpus.len == 0:
     echo "parser bench: no corpus loaded"
-  measure("parser throughput full corpus x50 (x$1)" % $corpus.len, 10) do ():
+  measure("parser throughput key corpora x50", 10) do ():
     for i in 0 ..< 50:
       for chunk in corpus:
         keyparser.parse(st, chunk, events)
@@ -188,24 +213,46 @@ proc main =
     benchStyledDiff(),
     benchTranscript(),
   ]
-  for r in results:
-    echo r.name & ": " & r.ms.formatFloat(ffDecimal, 3) & " ms"
-
   let baselinePath = "bench/baseline.txt"
+  var baseline: seq[(string, float, int)]
   if fileExists(baselinePath):
     for line in baselinePath.lines:
       let parts = line.split('=')
       if parts.len != 2:
         continue
-      for r in results:
-        if r.name == parts[0]:
-          let best = parseFloat(parts[1])
-          if r.ms > best * 2.0:
-            echo "REGRESSION: " & r.name & " " & $r.ms & " ms > 2x baseline " &
-              $best & " ms"
-            quit(1)
-    echo "baseline check: ok (" & baselinePath & ")"
-  else:
+      let values = parts[1].split(',')
+      let allocs = if values.len >= 2: parseInt(values[1].strip) else: -1
+      baseline.add (parts[0], parseFloat(values[0].strip), allocs)
+  var failed = false
+  var matched = 0
+  for r in results:
+    var line = r.name & ": " & r.ms.formatFloat(ffDecimal, 3) & " ms"
+    if defined(nimAllocStats):
+      line.add ", " & $r.allocs & " allocs"
+    for entry in baseline:
+      if entry[0] != r.name:
+        continue
+      inc matched
+      line.add " (" & (r.ms / entry[1]).formatFloat(ffDecimal, 2) &
+        "x baseline)"
+      if r.ms > entry[1] * 2.0:
+        line.add " REGRESSION: > 2x baseline time"
+        failed = true
+      if defined(nimAllocStats) and entry[2] >= 0 and
+          float(r.allocs) > float(entry[2]) * 1.1 + 2:
+        line.add " REGRESSION: " & $r.allocs & " allocs > baseline " &
+          $entry[2]
+        failed = true
+    echo line
+  if baseline.len == 0:
     echo "no baseline file at " & baselinePath & ", skipping regression check"
+  elif matched < results.len:
+    echo "baseline check: " & $(results.len - matched) &
+      " case(s) missing from " & baselinePath
+    quit(1)
+  elif failed:
+    quit(1)
+  else:
+    echo "baseline check: ok (" & baselinePath & ")"
 
 main()

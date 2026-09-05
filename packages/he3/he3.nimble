@@ -36,7 +36,7 @@ task fuzz, "run bounded deterministic fuzz/property smoke tests":
 
 task bench, "run he3 benchmarks":
   prepareBuildDir("bench")
-  exec "nim c -r --threads:on -d:release --path:src --nimcache:build/nimcache/bench --out:build/bench/he3 bench/bench.nim"
+  exec "nim c -r --threads:on -d:release -d:nimAllocStats --path:src --nimcache:build/nimcache/bench --out:build/bench/he3 bench/bench.nim"
 
 task docs, "build he3 API documentation":
   exec "nim doc --path:src --outdir:build/htmldocs src/he3.nim"

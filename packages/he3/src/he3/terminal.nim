@@ -19,6 +19,7 @@ type
     sgrMouse*: bool
     focusEvents*: bool
     synchronizedOutput*: bool
+    scrollRegions*: bool
     hyperlinks*: bool
     clipboard*: bool
     kittyGraphics*: bool
@@ -62,6 +63,7 @@ proc detectCapabilities*(identity = envIdentity(),
   result.focusEvents = result.kittyKeyboard or "xterm" in term
   result.synchronizedOutput = "kitty" in term or "wezterm" in term or
     program in ["ghostty", "iterm.app"]
+  result.scrollRegions = term != "dumb"
   result.hyperlinks = result.colorDepth != colorNone and
     (program in ["iterm.app", "wezterm", "ghostty"] or "kitty" in term)
   # OSC 52 works in the terminals below; every write still requires the

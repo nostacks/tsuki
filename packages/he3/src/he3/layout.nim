@@ -55,10 +55,11 @@ func intrinsic*(preferred: int, minimum = 0,
     preferred: clamp(preferred, minimum, max(minimum, maximum)),
     intrinsicMin: minimum, intrinsicMax: max(minimum, maximum))
 
-proc distribute(total: int, constraints: openArray[Constraint]): seq[int] =
-  ## Resolves constraint sizes for one axis. Fixed first, percent of total,
-  ## remaining split among fills by weight with remainder to the last fill.
-  result = newSeq[int](constraints.len)
+proc distribute(total: int, constraints: openArray[Constraint],
+    result: var openArray[int]) =
+  ## Resolves constraint sizes for one axis into `result`. Fixed first,
+  ## percent of total, remaining split among fills by weight with remainder
+  ## to the last fill.
   var used = 0
   var fillWeight = 0
   var boundedWeight = 0
@@ -111,22 +112,46 @@ proc distribute(total: int, constraints: openArray[Constraint]): seq[int] =
   elif lastFill < 0 and lastPercent >= 0 and boundedRest > 0:
     result[lastPercent] += boundedRest
 
+proc distribute(total: int, constraints: openArray[Constraint]): seq[int] =
+  result = newSeq[int](constraints.len)
+  distribute(total, constraints, result)
+
+const inlineSplit = 16
+
+proc sizesInto(total: int, constraints: openArray[Constraint],
+    small: var array[inlineSplit, int], large: var seq[int]) =
+  ## Resolves sizes on the stack for ordinary splits; only unusually long
+  ## constraint lists allocate.
+  if constraints.len <= inlineSplit:
+    distribute(total, constraints, small.toOpenArray(0, constraints.len - 1))
+  else:
+    large = newSeq[int](constraints.len)
+    distribute(total, constraints, large)
+
 proc splitH*(r: Rect, constraints: varargs[Constraint]): seq[Rect] =
   ## Splits `r` horizontally (columns); later rects are zero-width on
   ## overflow, never negative.
-  let sizes = distribute(r.width, constraints)
+  var small: array[inlineSplit, int]
+  var large: seq[int]
+  sizesInto(r.width, constraints, small, large)
+  result = newSeq[Rect](constraints.len)
   var x = r.x
-  for i in 0 ..< sizes.len:
-    result.add Rect(x: x, y: r.y, width: sizes[i], height: r.height)
-    x += sizes[i]
+  for i in 0 ..< constraints.len:
+    let size = if constraints.len <= inlineSplit: small[i] else: large[i]
+    result[i] = Rect(x: x, y: r.y, width: size, height: r.height)
+    x += size
 
 proc splitV*(r: Rect, constraints: varargs[Constraint]): seq[Rect] =
   ## Splits `r` vertically (rows); later rects are zero-height on overflow.
-  let sizes = distribute(r.height, constraints)
+  var small: array[inlineSplit, int]
+  var large: seq[int]
+  sizesInto(r.height, constraints, small, large)
+  result = newSeq[Rect](constraints.len)
   var y = r.y
-  for i in 0 ..< sizes.len:
-    result.add Rect(x: r.x, y: y, width: r.width, height: sizes[i])
-    y += sizes[i]
+  for i in 0 ..< constraints.len:
+    let size = if constraints.len <= inlineSplit: small[i] else: large[i]
+    result[i] = Rect(x: r.x, y: y, width: r.width, height: size)
+    y += size
 
 func trim*(r: Rect, top, bottom, left, right: int): Rect =
   ## Shrinks `r` by the given edges, clamped to zero size.

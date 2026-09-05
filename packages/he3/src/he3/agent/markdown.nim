@@ -30,7 +30,8 @@ proc parseInline(value: string, base: Style, colors: AgentTheme): Line =
     if until > plainStart:
       result.addSpan(value[plainStart ..< until], base)
   while index < value.len:
-    if index + 1 < value.len and value[index .. index + 1] == "**":
+    if index + 1 < value.len and value[index] == '*' and
+        value[index + 1] == '*':
       let finish = value.find("**", index + 2)
       if finish >= 0:
         flushPlain(index)
@@ -172,14 +173,14 @@ proc buildDocument(state: var MarkdownState, colors: AgentTheme) =
   inc state.version
   state.document.version = state.version
 
-proc feed*(state: var MarkdownState, chunk: string,
+proc feed*(state: var MarkdownState, chunk: openArray[char],
     colors = agentTheme()) =
   ## Accepts arbitrary byte boundaries. Completed lines are parsed exactly once
   ## in place; only the current incomplete line is rebuilt, preserving
   ## one-shot equality without copying the stable prefix.
   let room = max(0, state.maxBytes - state.source.len)
   if room > 0 and chunk.len > 0:
-    state.source.add chunk[0 ..< min(room, chunk.len)]
+    state.source.addChars chunk.toOpenArray(0, min(room, chunk.len) - 1)
   if chunk.len > room and not state.source.endsWith("\n… markdown truncated"):
     state.source.add "\n… markdown truncated"
   var newline = state.source.find('\n', state.committedBytes)

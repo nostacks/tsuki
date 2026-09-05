@@ -117,7 +117,7 @@ end-of-file the loop ends on its own.
 |---|---|---|
 | `mode` | `tmFullscreen` | `tmFullscreen` uses the alternate screen, `tmInline` draws in the normal screen, `tmHeadless` renders into memory only. |
 | `mouse` | `false` | Enables SGR mouse tracking. |
-| `probeCapabilities` | `true` | Sends a startup query for the kitty keyboard protocol. |
+| `probeCapabilities` | `true` | Sends startup queries for the kitty keyboard protocol and synchronized output. |
 | `maxFramesPerSecond` | `60` | Caps how often `redraw()` produces a frame. |
 | `headlessWidth`, `headlessHeight` | `80`, `24` | Viewport used by `tmHeadless`. |
 | `maxPostedEvents` | `4096` | Bound of the cross-thread event queue. |
@@ -194,8 +194,9 @@ is silently dropped, so drawing code never has to bounds check.
 | Call | Purpose |
 |---|---|
 | `frame.sub(rect, style)` | A nested frame translated by and clipped to the parent. |
-| `frame.write(x, y, text, style)` | Sanitizes and writes a string. Newlines start a new row. |
+| `frame.write(x, y, text, style)` | Sanitizes and writes a string or a byte range (`openArray[char]`) without copying safe text. Newlines start a new row. |
 | `frame.write(x, y, richText)` | Writes a `Text` value with per-span styles. |
+| `frame.hintScroll(rows)` | Tells the renderer this frame's rows moved by `rows` since the last frame (positive is up). The diff may scroll the terminal region instead of repainting it; drawing is unaffected. |
 | `frame.fill(rect, rune, style)` | Fills a rectangle with one rune. |
 | `frame.clear(rect, style)` | Fills with spaces. `clearAll` clears the whole frame. |
 | `frame.tint(rect, style)` | Restyles cells without changing glyphs. |
@@ -263,7 +264,10 @@ strings.
 
 Grapheme utilities for measuring and clipping your own strings: `cellWidth`,
 `truncateCells` (clips at cluster boundaries and appends a single ellipsis),
-`textWidth`, `clusterWidth`, and the `graphemes` iterator.
+`writeFit` (writes the fitting prefix of a byte range straight into a frame),
+`textWidth`, `clusterWidth`, and `graphemeSpans`. All of them measure
+without allocating; the `graphemes` iterator copies each cluster and is for
+convenience, not hot paths.
 
 ## Styles and themes
 
@@ -587,8 +591,11 @@ Rules for this mode:
 `COLORTERM`, `TERM_PROGRAM`, `NO_COLOR`, and the locale and returns a
 conservative `TerminalCapabilities` value without blocking probes. It reports
 color depth, kitty keyboard support, SGR mouse, focus events, synchronized
-output, hyperlinks, clipboard, image protocols, Unicode, and the width policy.
-`monochromeCapabilities()` is the deterministic lowest profile.
+output, scroll regions, hyperlinks, clipboard, image protocols, Unicode, and
+the width policy. `monochromeCapabilities()` is the deterministic lowest
+profile. With `probeCapabilities` on, startup also sends a DECRQM query for
+synchronized output (mode 2026) alongside the kitty keyboard query, and a
+terminal's answer overrides the environment guess.
 
 Optional protocols live under `he3/protocols` and are not part of the
 main facade. Each one requires an advertised capability and returns bytes or a
@@ -604,6 +611,10 @@ safe fallback rather than writing to the terminal itself:
   encodes kitty graphics chunks together with a mandatory alt text fallback.
 - `syncoutput` returns the synchronized output markers, which the runtime
   already wraps around every frame on terminals that support them.
+- Scroll regions (`DECSTBM` with `SU`/`SD`) are used only for a frame that
+  carries a scroll hint, and only when every cell beside the hinted rows is
+  blank, so nothing outside the region can move. The transcript view hints
+  its own scrolling; the diff repaints whatever the scroll did not cover.
 
 Everything else is plain cells. When a capability is false the framework never
 emits the protocol.

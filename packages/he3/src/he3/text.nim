@@ -158,6 +158,14 @@ func decodeUtf8(data: openArray[char], at: int, r: var Rune): int =
   r = Rune(value)
   need
 
+proc addChars*(dest: var string, value: openArray[char]) =
+  ## Appends a byte range to `dest` without an intermediate string.
+  if value.len == 0:
+    return
+  let start = dest.len
+  dest.setLen(start + value.len)
+  copyMem(addr dest[start], unsafeAddr value[0], value.len)
+
 func isSanitized*(input: openArray[char],
     policy = plainTextPolicy()): bool =
   ## True when `sanitizeText` would return `input` unchanged: valid UTF-8,
