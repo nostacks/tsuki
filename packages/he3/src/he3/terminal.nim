@@ -65,14 +65,19 @@ proc detectCapabilities*(identity = envIdentity(),
     program in ["ghostty", "iterm.app"]
   result.scrollRegions = term != "dumb"
   result.hyperlinks = result.colorDepth != colorNone and
-    (program in ["iterm.app", "wezterm", "ghostty"] or "kitty" in term)
+    (program in ["iterm.app", "wezterm", "ghostty", "vscode"] or
+      "kitty" in term or "alacritty" in term or term.startsWith("foot"))
   # OSC 52 works in the terminals below; every write still requires the
   # application's explicit copy call.
   result.clipboard = result.colorDepth != colorNone and
     (program in ["iterm.app", "wezterm", "ghostty"] or "kitty" in term)
-  result.kittyGraphics = "kitty" in term or program == "ghostty"
-  result.sixelGraphics = "sixel" in term
-  result.itermImages = program == "iterm.app"
+  # Image protocols stay off inside multiplexers, which do not pass the
+  # placement commands through reliably.
+  let direct = identity.multiplexer.len == 0
+  result.kittyGraphics = direct and ("kitty" in term or
+    program in ["ghostty", "wezterm"])
+  result.sixelGraphics = direct and "sixel" in term
+  result.itermImages = direct and program == "iterm.app"
   result.widthPolicy = WidthPolicy(ambiguous: awNarrow)
 
 func monochromeCapabilities*(): TerminalCapabilities =

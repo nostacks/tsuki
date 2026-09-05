@@ -1,6 +1,7 @@
 ## Safe projection from product controller events to the public he3 facade.
 
-import controller, types
+import std/os
+import controller, preview, types
 import he3/agent as ui
 from he3/agent/model import agentError
 
@@ -16,16 +17,24 @@ func uiAttachmentState(state: AttachmentState): ui.AttachmentViewState =
   of attachmentSent: ui.attachmentViewSent
   of attachmentFailed: ui.attachmentViewFailed
 
-func uiAttachment(image: ImageReference): ui.Attachment =
+proc uiAttachment(image: ImageReference, workspaceRoot: string):
+    ui.Attachment =
+  ## Projects one image reference. `source` is the absolute path the host's
+  ## image loader accepts for inline preview.
+  let source = if workspaceRoot.len == 0: ""
+    elif image.location == attachmentWorkspaceRelative:
+      attachmentSourcePrefix & (workspaceRoot / image.path)
+    else: attachmentSourcePrefix & image.path
   ui.Attachment(id: $image.id, name: image.displayName,
     mediaType: image.mediaType, sizeBytes: image.sizeBytes,
     width: image.width, height: image.height, altText: image.altText,
-    state: image.state.uiAttachmentState)
+    state: image.state.uiAttachmentState, source: source)
 
-proc uiAttachments(message: Message): seq[ui.Attachment] =
+proc uiAttachments(message: Message, workspaceRoot: string):
+    seq[ui.Attachment] =
   for part in message.parts:
     if part.kind == contentImageReference:
-      result.add part.image.uiAttachment
+      result.add part.image.uiAttachment(workspaceRoot)
 
 proc projectSession*(chat: ui.AgentChat, session: Session) =
   ## Rebuilds the transcript from canonical messages without provider fields.
@@ -35,12 +44,13 @@ proc projectSession*(chat: ui.AgentChat, session: Session) =
   chat.sessionId = $session.id
   chat.stagedAttachments.setLen 0
   for attachment in session.stagedAttachments:
-    chat.apply ui.attachmentStaged(attachment.uiAttachment)
+    chat.apply ui.attachmentStaged(attachment.uiAttachment(
+      session.workspaceRoot))
   for message in session.messages:
     case message.role
     of messageUser:
       chat.apply ui.userMessage($message.id, message.messageText,
-        message.uiAttachments)
+        message.uiAttachments(session.workspaceRoot))
     of messageAssistant:
       for part in message.parts:
         case part.kind
@@ -65,14 +75,16 @@ proc projectSession*(chat: ui.AgentChat, session: Session) =
   chat.active = false
   chat.cancelled = session.lastTurnState in {turnCancelled, turnInterrupted}
 
-proc tuiEventSink*(chat: ui.AgentChat): ControllerEventProc =
+proc tuiEventSink*(chat: ui.AgentChat,
+    workspaceRoot = ""): ControllerEventProc =
   ## Creates the only controller-to-he3 dependency used by the product host.
+  ## `workspaceRoot` lets attachment previews resolve relative references.
   result = proc (event: ControllerEvent) {.gcsafe.} =
     if chat.isNil: return
     case event.kind
     of controllerUserMessage:
       discard chat.post ui.userMessage(event.id, event.message.messageText,
-        event.message.uiAttachments)
+        event.message.uiAttachments(workspaceRoot))
     of controllerTextDelta:
       discard chat.post ui.messageDelta(event.id, event.text)
     of controllerSummaryDelta:
@@ -111,7 +123,8 @@ proc tuiEventSink*(chat: ui.AgentChat): ControllerEventProc =
         contextLimit: event.contextLimit, offline: event.offline,
         saving: event.saving))
     of controllerAttachmentStaged:
-      discard chat.post ui.attachmentStaged(event.attachment.uiAttachment)
+      discard chat.post ui.attachmentStaged(
+        event.attachment.uiAttachment(workspaceRoot))
       if event.text.len > 0:
         discard chat.post ui.notice(event.id & ":warning", event.text)
     of controllerAttachmentDetached:

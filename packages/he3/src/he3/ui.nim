@@ -116,11 +116,34 @@ proc initUi*(mouse = false, probe = true, maxPostedEvents = 4096,
   let capabilities = detectCapabilities()
   output.syncOutput = capabilities.synchronizedOutput
   output.scrollRegions = capabilities.scrollRegions
+  output.hyperlinks = capabilities.hyperlinks
+  output.imageProtocol = if capabilities.kittyGraphics: imageOutKitty
+    elif capabilities.itermImages: imageOutIterm
+    else: imageOutNone
   initUiWith(output, mouse, probe, maxPostedEvents, mode)
 
+func imageProtocol*(ui: Ui): ImageProtocolOut {.inline.} =
+  ## The image transport this session may emit; `imageOutNone` means every
+  ## image request draws its text fallback instead.
+  ui.w.imageProtocol
+
+proc registerImage*(ui: var Ui, id: uint32, png: string,
+    widthPx, heightPx: int) =
+  ## Makes PNG bytes available to `Frame.image` placements under `id`. The
+  ## data is transmitted lazily with the first frame that shows it.
+  ui.w.registerImage(id, png, widthPx, heightPx)
+
+proc forgetImage*(ui: var Ui, id: uint32) =
+  ## Frees a registered image on the terminal and in memory.
+  ui.w.forgetImage(id)
+
 proc leave*(ui: var Ui) =
-  ## Restores the terminal.
+  ## Restores the terminal, freeing any inline images first.
   try:
+    try:
+      ui.w.deleteAllImagesNow()
+    except CatchableError:
+      discard
     ui.term.setSignalWakeFd(-1)
     ui.term.leave()
   finally:

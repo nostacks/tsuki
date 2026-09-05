@@ -377,6 +377,24 @@ proc parseComplete(state: var ParseState, events: var seq[Event]): bool =
     if state.buf.len == 1:
       return false
     case state.buf[1]
+    of byte('_'), byte(']'), byte('P'), byte('^'), byte('X'):
+      # Terminal replies (APC, OSC, DCS, PM, SOS) carry no key meaning and
+      # must never reach the application as typed text.
+      let osc = state.buf[1] == byte(']')
+      var i = 2
+      while i < state.buf.len:
+        if state.buf[i] == 0x1b:
+          if i + 1 >= state.buf.len:
+            return false
+          state.take(if state.buf[i + 1] == byte('\\'): i + 2 else: i)
+          state.altPending = false
+          return true
+        if osc and state.buf[i] == 0x07:
+          state.take(i + 1)
+          state.altPending = false
+          return true
+        inc i
+      return false
     of byte('['):
       var i = 2
       while i < state.buf.len and isCsiParam(state.buf[i]):
@@ -558,5 +576,9 @@ proc checkDeadline*(state: var ParseState, events: var seq[Event],
   elif state.buf.len >= 2 and state.buf[0] == 0x1b and state.buf[1] == 0x1b:
     events.add keyEvent(kcEscape)
     state.take(1)
+  elif state.buf.len == 2 and state.buf[0] == 0x1b and
+      state.buf[1] in {byte('_'), byte(']'), byte('P'), byte('^'), byte('X')}:
+    events.add keyEvent(kcChar, Rune(state.buf[1]), {modAlt})
+    state.take(2)
   else:
     state.buf.setLen 0

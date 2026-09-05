@@ -92,7 +92,7 @@ proc richText*(frame: Frame, value: Text, scroll = 0,
   ## no text is copied.
   if frame.rect.isEmpty:
     return
-  type Piece = tuple[line, span, a, b, x: int]
+  type Piece = tuple[line, span, a, b, x, w: int]
   let first = max(0, scroll)
   let last = first + frame.rect.height
   var row: seq[Piece]
@@ -105,6 +105,9 @@ proc richText*(frame: Frame, value: Text, scroll = 0,
         let span = value.lines[piece.line].spans[piece.span]
         frame.write(offset + piece.x, rowIndex - first,
           span.text.toOpenArray(piece.a, piece.b), span.style)
+        if span.hyperlink.uri.len > 0:
+          frame.linkCells(offset + piece.x, rowIndex - first, piece.w,
+            frame.link(span.hyperlink.uri))
     row.setLen 0
     inc rowIndex
     used = 0
@@ -121,8 +124,9 @@ proc richText*(frame: Frame, value: Text, scroll = 0,
         if row.len > 0 and row[^1].line == lineIndex and
             row[^1].span == spanIndex and row[^1].b + 1 == cluster.a:
           row[^1].b = cluster.b
+          row[^1].w += width
         else:
-          row.add (lineIndex, spanIndex, cluster.a, cluster.b, used)
+          row.add (lineIndex, spanIndex, cluster.a, cluster.b, used, width)
         inc used, width
     flushRow()
 

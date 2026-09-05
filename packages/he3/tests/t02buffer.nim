@@ -146,11 +146,65 @@ proc testScrollHint =
   b.hintScroll(initRect(0, 0, 4, 4), 3)
   check b.scrollHint.rows == 3, "reset clears the conflict"
 
+proc testLinks =
+  var b = initBuffer(8, 2)
+  let first = b.internLink("https://example.com")
+  let again = b.internLink("https://example.com")
+  let second = b.internLink("https://other.example")
+  check first == 1 and again == 1 and second == 2,
+    "links intern once per frame and number from one"
+  check b.internLink("") == 0, "an empty URI never links"
+  b.writeStr(0, 0, "site")
+  b.linkCells(0, 0, 4, first)
+  check b.cellAt(0, 0).link == first and b.cellAt(3, 0).link == first and
+    b.cellAt(4, 0).link == 0, "linkCells marks exactly the requested cells"
+  check b.linkUri(first) == "https://example.com" and b.linkUri(0) == "",
+    "linkUri resolves ids and treats zero as no link"
+  var other = initBuffer(8, 2)
+  discard other.internLink("https://other.example")
+  let sameUri = other.internLink("https://example.com")
+  other.writeStr(0, 0, "site")
+  other.linkCells(0, 0, 4, sameUri)
+  check sameCell(b, 0, other, 0),
+    "cells compare links by URI even when the ids differ"
+  other.linkCells(0, 0, 1, 1)
+  check not sameCell(b, 0, other, 0),
+    "a different URI makes otherwise equal cells differ"
+  b.resize(6, 2)
+  check b.linkUri(b.cellAt(0, 0).link) == "https://example.com",
+    "resizing keeps links by re-interning their URIs"
+  b.writeStr(0, 0, "x")
+  check b.cellAt(0, 0).link == 0, "overwriting a cell drops its link"
+  b.reset()
+  check b.links.len == 0, "reset clears the link table"
+
+proc testImages =
+  var b = initBuffer(10, 4)
+  b.writeStr(0, 1, "under text")
+  b.placeImage(7, 2, 1, 4, 2)
+  check b.images.len == 1 and b.images[0].rect == initRect(2, 1, 4, 2) and
+    b.images[0].offsetX == 0 and b.images[0].offsetY == 0,
+    "a placement inside the buffer keeps its full box"
+  check b.cellAt(2, 1) == defaultCell() and b.cellAt(6, 1).rune == Rune('t'),
+    "the image box is blanked and cells beside it stay"
+  b.placeImage(8, -2, -1, 5, 3)
+  check b.images[1].rect == initRect(0, 0, 3, 2) and
+    b.images[1].offsetX == 2 and b.images[1].offsetY == 1 and
+    b.images[1].cols == 5 and b.images[1].rows == 3,
+    "a box cut by the top-left edge records the visible part and offsets"
+  b.placeImage(9, 20, 20, 2, 2)
+  b.placeImage(0, 0, 0, 2, 2)
+  check b.images.len == 2, "boxes outside the buffer and id zero are ignored"
+  b.reset()
+  check b.images.len == 0, "reset drops placements"
+
 proc main =
   testBasics()
   testResize()
   testScrollRows()
   testScrollHint()
+  testLinks()
+  testImages()
   testWriteStr()
   testNewline()
   testWideChars()

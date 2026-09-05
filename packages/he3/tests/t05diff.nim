@@ -295,11 +295,170 @@ proc testFirstDifference =
   check a.firstDifference(b, 5) == 0, "invalid rows differ at column zero"
   check a.sameRow(b, 0) and not a.sameRow(b, 1), "sameRow agrees"
 
+func text(bytes: seq[byte]): string =
+  result = newString(bytes.len)
+  for index, value in bytes:
+    result[index] = char(value)
+
+proc testHyperlinks =
+  var prev = initBuffer(12, 2)
+  var next = initBuffer(12, 2)
+  next.writeStr(0, 0, "see docs now")
+  next.linkCells(4, 0, 4, next.internLink("https://example.com/d"))
+  block advertised:
+    var t = initFakeTty()
+    var o = t.wr
+    o.hyperlinks = true
+    diffInto(prev, next, o)
+    let written = o.fake.bytes.text
+    let open = written.find("\e]8;;https://example.com/d\e\\docs")
+    check open >= 0, "linked cells open OSC 8 with their URI"
+    check written.find("docs\e[1;10H\e]8;;\e\\now") >= 0,
+      "the link closes before the next unlinked cell"
+    prev = next
+    o.fake.bytes.setLen 0
+    diffInto(prev, next, o)
+    check o.fake.bytes.len == 0, "an unchanged linked frame writes nothing"
+  block plain:
+    var t = initFakeTty()
+    var o = t.wr
+    var blank = initBuffer(12, 2)
+    diffInto(blank, next, o)
+    check "\e]8" notin o.fake.bytes.text,
+      "no OSC 8 is emitted without the capability"
+  block unsafe:
+    var t = initFakeTty()
+    var o = t.wr
+    o.hyperlinks = true
+    var blank = initBuffer(12, 2)
+    var hostile = initBuffer(12, 2)
+    hostile.writeStr(0, 0, "x")
+    hostile.linkCells(0, 0, 1, hostile.internLink("https://a\e]52;c;owned"))
+    diffInto(blank, hostile, o)
+    check "owned" notin o.fake.bytes.text,
+      "a URI carrying a control byte is never emitted"
+
+proc testImages =
+  block kitty:
+    var t = initFakeTty()
+    var o = t.wr
+    o.imageProtocol = imageOutKitty
+    o.registerImage(7, "png", 40, 20)
+    var prev = initBuffer(12, 6)
+    var next = initBuffer(12, 6)
+    next.placeImage(7, 2, 1, 4, 2)
+    diffInto(prev, next, o)
+    var written = o.fake.bytes.text
+    check written.contains("\e_Ga=t,f=100,i=7,q=2,q=2,m=0;cG5n\e\\"),
+      "the first placement transmits the PNG once"
+    check written.contains("\e[2;3H\e_Ga=p,i=7,p=1,c=4,r=2,C=1,q=2\e\\"),
+      "a placement is positioned by cursor move and keeps the cursor"
+    prev = next
+    o.fake.bytes.setLen 0
+    diffInto(prev, next, o)
+    check o.fake.bytes.len == 0, "a shown placement is not re-sent"
+    var cropped = initBuffer(12, 6)
+    cropped.placeImage(7, 2, -1, 4, 2)
+    o.fake.bytes.setLen 0
+    diffInto(prev, cropped, o)
+    written = o.fake.bytes.text
+    check written.contains("\e_Ga=d,d=i,i=7,p=1,q=2\e\\"),
+      "a moved placement is deleted by placement id"
+    check written.contains("a=p,i=7,p=2,x=0,y=10,w=40,h=10,c=4,r=1,C=1,q=2"),
+      "a placement cut by the edge crops the source pixels"
+    check "a=t" notin written, "the image data is not transmitted again"
+    prev = cropped
+    var gone = initBuffer(12, 6)
+    o.fake.bytes.setLen 0
+    diffInto(prev, gone, o)
+    check o.fake.bytes.text.contains("a=d,d=i,i=7,p=2"),
+      "a dropped placement is deleted"
+    o.fake.bytes.setLen 0
+    o.forgetImage(7)
+    check o.fake.bytes.text == "\e_Ga=d,d=I,i=7,q=2\e\\",
+      "forgetting an image frees it immediately"
+    check not o.hasImage(7), "a forgotten image is gone from the sink"
+  block iterm:
+    var t = initFakeTty()
+    var o = t.wr
+    o.imageProtocol = imageOutIterm
+    o.registerImage(3, "png", 40, 20)
+    var prev = initBuffer(12, 6)
+    var next = initBuffer(12, 6)
+    next.placeImage(3, 1, 1, 4, 2)
+    diffInto(prev, next, o)
+    check o.fake.bytes.text.contains("\e[2;2H\e]1337;File=inline=1;" &
+      "doNotMoveCursor=1;preserveAspectRatio=0;width=4;height=2;" &
+      "size=3:cG5n\a"),
+      "iTerm placements carry the whole payload inline"
+    prev = next
+    var cropped = initBuffer(12, 6)
+    cropped.placeImage(3, 1, -1, 4, 2)
+    o.fake.bytes.setLen 0
+    diffInto(prev, cropped, o)
+    check "1337" notin o.fake.bytes.text,
+      "a cropped iTerm image is not drawn"
+    check o.fake.bytes.text.contains("\e[2;2H"),
+      "cells under the removed iTerm image are repainted"
+  block deferred:
+    var t = initFakeTty()
+    var o = t.wr
+    o.imageProtocol = imageOutKitty
+    o.registerImage(4, "png", 40, 20)
+    var prev = initBuffer(12, 6)
+    var first = initBuffer(12, 6)
+    first.placeImage(4, 0, 0, 4, 2)
+    diffInto(prev, first, o)
+    prev = first
+    o.deferPlacements = true
+    var moved = initBuffer(12, 6)
+    moved.placeImage(4, 0, 2, 4, 2)
+    o.fake.bytes.setLen 0
+    diffInto(prev, moved, o)
+    let scrolling = o.fake.bytes.text
+    check scrolling.contains("a=d,d=i,i=4,p=1") and "a=p" notin scrolling,
+      "while deferring, stale placements go away but none are added"
+    prev = moved
+    o.deferPlacements = false
+    o.fake.bytes.setLen 0
+    diffInto(prev, moved, o)
+    check o.fake.bytes.text.contains("a=p,i=4,p=2"),
+      "the settled frame places the image where it rests"
+  block unavailable:
+    var t = initFakeTty()
+    var o = t.wr
+    o.registerImage(3, "png", 40, 20)
+    var prev = initBuffer(12, 6)
+    var next = initBuffer(12, 6)
+    next.placeImage(3, 1, 1, 4, 2)
+    diffInto(prev, next, o)
+    check o.fake.bytes.len == 0,
+      "without an image protocol a placement emits nothing"
+    check not o.hasImage(3), "images are not stored without a protocol"
+  block fullFlush:
+    var t = initFakeTty()
+    var o = t.wr
+    o.imageProtocol = imageOutKitty
+    o.registerImage(5, "png", 10, 10)
+    var frame = initBuffer(8, 3)
+    frame.placeImage(5, 0, 0, 2, 1)
+    o.flushFull(frame)
+    check o.fake.bytes.text.contains("a=p,i=5,p=1"),
+      "a full flush places images after the rows"
+    o.fake.bytes.setLen 0
+    o.flushFull(frame)
+    let again = o.fake.bytes.text
+    check again.contains("\e_Ga=d,d=a,q=2\e\\") and
+      again.contains("a=p,i=5,p=2"),
+      "a repeated full flush deletes all placements and re-places them"
+
 proc main =
   testBasicDiff()
   testProperty()
   testScrollHint()
   testFirstDifference()
+  testHyperlinks()
+  testImages()
   echo "diff ok"
 
 main()

@@ -122,6 +122,35 @@ proc writeAsciiRun*(f: Frame, x, y: int, run: openArray[char],
       f.writeRun(x + start, y, run.toOpenArray(start, index - 1), style)
     start = index + 1
 
+proc link*(f: Frame, uri: string): uint16 =
+  ## Interns a hyperlink URI for this frame's buffer and returns the id to
+  ## pass to `linkCells`. Zero means the link will not be emitted.
+  f.buf[].internLink(uri)
+
+proc linkCells*(f: Frame, x, y, width: int, link: uint16) =
+  ## Attaches an interned link to `width` cells starting at frame-relative
+  ## `x`, `y`; cells outside the frame are left alone.
+  if link == 0 or y < 0 or y >= f.rect.height or width <= 0:
+    return
+  let first = max(0, x)
+  let last = min(f.rect.width, x + width)
+  if first >= last:
+    return
+  f.buf[].linkCells(f.rect.x + first, f.rect.y + y, last - first, link)
+
+proc image*(f: Frame, x, y, cols, rows: int, imageId: uint32) =
+  ## Reserves a cell box for a host-registered image, clipped to the frame.
+  ## Terminals without an image protocol show whatever the caller draws
+  ## instead, so always pair this with a text fallback decision.
+  let abs = initRect(f.rect.x + x, f.rect.y + y, cols, rows)
+  let visible = intersection(abs, f.rect)
+  if visible.isEmpty or imageId == 0:
+    return
+  f.buf[].clear(visible)
+  f.buf[].images.add ImagePlacement(imageId: imageId, rect: visible,
+    cols: cols, rows: rows, offsetX: visible.x - abs.x,
+    offsetY: visible.y - abs.y)
+
 proc hintScroll*(f: Frame, rows: int) =
   ## Tells the renderer that this frame's rows moved by `rows` since the last
   ## frame (positive is up), so the terminal may scroll instead of repainting.

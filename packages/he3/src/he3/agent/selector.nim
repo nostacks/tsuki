@@ -188,6 +188,7 @@ type
     paIgnored
     paChanged
     paDeviceLogin
+    paDeviceLogout
     paKeySubmitted
     paCancelled
 
@@ -231,8 +232,8 @@ func authRemember(state: var ProviderAuthUi,
 
 proc providerAuthEvent*(state: var ProviderAuthUi,
     entries: openArray[ProviderAuthEntry], event: Event): ProviderAuthOutcome =
-  ## Handles the provider sign-in dialog: provider list, search, device
-  ## login activation, and the masked API key editor.
+  ## Handles the provider dialog: provider list, search, device sign-in and
+  ## sign-out, and the masked API key editor.
   if state.keyEntry:
     # Bracketed paste arrives as evPaste and must reach the editor directly.
     if event.kind == evPaste:
@@ -290,6 +291,13 @@ proc providerAuthEvent*(state: var ProviderAuthUi,
         state.keyEditor = initTextareaState()
         return ProviderAuthOutcome(kind: paChanged)
     return ProviderAuthOutcome(kind: paIgnored)
+  if event.key.isKey(kcDelete):
+    if visible.len > 0:
+      let entry = entries[visible[min(state.selected, visible.len - 1)]]
+      if entry.kind == providerAuthDevice:
+        state.selectedProviderId = entry.providerId
+        return ProviderAuthOutcome(kind: paDeviceLogout, entry: entry)
+    return ProviderAuthOutcome(kind: paIgnored)
   if event.key.isKey(kcBackspace):
     if state.query.len > 0:
       state.query.dropLastCluster()
@@ -306,8 +314,8 @@ proc providerAuthEvent*(state: var ProviderAuthUi,
 
 proc providerAuthPicker*(frame: Frame, entries: openArray[ProviderAuthEntry],
     state: var ProviderAuthUi, colors = agentTheme()) =
-  ## Draws the provider sign-in dialog: one row per provider with its auth
-  ## action, or the masked API key editor while one is being entered.
+  ## Draws the provider dialog: one row per provider with its auth actions,
+  ## or the masked API key editor while one is being entered.
   if state.keyEntry:
     var providerName = state.keyFor
     for entry in entries:
@@ -331,7 +339,7 @@ proc providerAuthPicker*(frame: Frame, entries: openArray[ProviderAuthEntry],
         "enter save · esc cancel".truncateCells(frame.rect.width, true),
         colors.base.muted)
     return
-  frame.write(0, 0, "Provider sign-in", colors.base.accent)
+  frame.write(0, 0, "Providers", colors.base.accent)
   if frame.rect.height > 1:
     frame.write(0, 1, ("Search: " & state.query & "▌").truncateCells(
       frame.rect.width, true), colors.base.focus)
@@ -356,7 +364,7 @@ proc providerAuthPicker*(frame: Frame, entries: openArray[ProviderAuthEntry],
       of providerAuthMissing: "no key"
       of providerAuthUnknown: ""
     let action = case entry.kind
-      of providerAuthDevice: "enter to sign in"
+      of providerAuthDevice: "enter to sign in · del to sign out"
       of providerAuthApiKey:
         if entry.status == providerAuthReady: "enter to replace key"
         else: "enter to add API key"
@@ -372,8 +380,9 @@ proc providerAuthPicker*(frame: Frame, entries: openArray[ProviderAuthEntry],
       if selected: colors.base.focus else: colors.base.text)
   if frame.rect.height > 0:
     frame.write(0, frame.rect.height - 1,
-      "↑↓ move · enter sign in or add key · esc cancel".truncateCells(
-        frame.rect.width, true), colors.base.muted)
+      ("↑↓ move · enter sign in or add key · del sign out · " &
+        "esc cancel").truncateCells(frame.rect.width, true),
+      colors.base.muted)
 
 proc modelSelector*(frame: Frame, entries: openArray[SelectorEntry],
     state: SelectorState, loading = false, error = "",

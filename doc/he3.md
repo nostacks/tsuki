@@ -141,6 +141,12 @@ discard runTui(proc (frame: var Frame) = frame.text("inline"), options)
 
 ## Events
 
+Terminal replies that are strings rather than keys (APC, OSC, DCS, PM, and
+SOS, such as a graphics acknowledgement or a clipboard answer) are consumed
+by the parser and never surface as typed text. An introducer that is never
+terminated resolves at the deadline as its Alt key, so legacy Alt-] input
+still works.
+
 `Event` is an object variant. `kind` selects the payload:
 
 | Kind | Payload | Source |
@@ -257,10 +263,20 @@ proc draw(frame: var Frame) =
 ```
 
 `Text` is a sequence of `Line`s, each a sequence of `Span`s carrying a
-string, a `Style`, and an optional `Hyperlink`. Build it with `initText`,
-`initLine`, `initSpan`, and `add`. `richText` wraps at grapheme boundaries and
-respects explicit lines; `paragraph` does greedy word wrapping for plain
-strings.
+string, a `Style`, and an optional `Hyperlink`. A `Line` may also carry an
+`ImageRef`: views that can show images resolve its `source` through the host
+and draw the line's spans as the caption or fallback. Build text with
+`initText`, `initLine`, `initSpan`, and `add`. `richText` wraps at grapheme
+boundaries, respects explicit lines, and attaches span hyperlinks to the cells
+it writes; `paragraph` does greedy word wrapping for plain strings.
+
+The agent toolkit under `he3/agent` builds on this: `parseMarkdown` and the
+streaming `MarkdownState` cover headings, emphasis, strikethrough, code,
+links, autolinks, images, nested and ordered lists, task lists, quotes,
+rules, tables, and math; `highlightLine` tokenizes one source line per
+language with block-comment state carried between lines; `renderMath` turns
+LaTeX into Unicode text. Every construct is decided from one line plus the
+block state before it, so streamed output equals one-shot parsing.
 
 Grapheme utilities for measuring and clipping your own strings: `cellWidth`,
 `truncateCells` (clips at cluster boundaries and appends a single ellipsis),
@@ -596,6 +612,28 @@ the width policy. `monochromeCapabilities()` is the deterministic lowest
 profile. With `probeCapabilities` on, startup also sends a DECRQM query for
 synchronized output (mode 2026) alongside the kitty keyboard query, and a
 terminal's answer overrides the environment guess.
+
+Cells can carry hyperlinks and frames can reserve image boxes; both are
+capability-gated and travel through the ordinary diff:
+
+- `Frame.link(uri)` interns a URI for the frame and `linkCells` attaches it
+  to cells. When the terminal advertises hyperlinks the diff wraps exactly
+  those cells in OSC 8, closing the link before any unlinked cell, erase, or
+  frame end. URIs containing control bytes are never emitted.
+- `Frame.image(x, y, cols, rows, imageId)` blanks a cell box and records a
+  placement. The host registers PNG bytes with `Ui.registerImage` and frees
+  them with `forgetImage`. With the kitty graphics protocol the data is
+  transmitted once and each placement is a small command with a cropped
+  source rectangle when an edge cuts the box; with iTerm2 inline images the
+  payload accompanies each fully visible placement. Placements are diffed
+  like cells: nothing is re-sent for an unchanged frame, moved or dropped
+  boxes are deleted before the cell diff repaints beneath them, and a full
+  repaint deletes and re-places everything. `Out.deferPlacements` lets a host
+  skip new placements while content is moving; the agent shell sets it while
+  the transcript offset changes and clears it 150 ms after the last change,
+  so a fast scroll deletes stale images but places each image once at rest.
+  Multiplexers disable images.
+- Sixel is detected but not emitted; it would need a pixel decoder.
 
 Optional protocols live under `he3/protocols` and are not part of the
 main facade. Each one requires an advertised capability and returns bytes or a

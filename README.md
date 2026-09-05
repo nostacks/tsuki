@@ -70,7 +70,6 @@ Start without credentials and add a key in the app:
 ```sh
 ./build/tsuki --new
 ```
-
 ## Examples
 
 The repository keeps three public examples:

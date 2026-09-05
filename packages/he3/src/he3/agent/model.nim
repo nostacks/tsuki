@@ -74,6 +74,9 @@ type
     height*: int
     altText*: string
     state*: AttachmentViewState
+    source*: string
+      ## Host key the image can be loaded by for inline preview, such as an
+      ## absolute path. Empty when the host offers no preview.
 
   RateLimit* = object
     remaining*: int64
@@ -564,7 +567,8 @@ proc safeAttachments(values: openArray[Attachment]): seq[Attachment] =
       value.mediaType, plainTextPolicy(maxBytes = 128)),
       sizeBytes: max(0'i64, value.sizeBytes), width: max(0, value.width),
       height: max(0, value.height), altText: sanitizeText(value.altText,
-      plainTextPolicy(maxBytes = 4096)), state: value.state)
+      plainTextPolicy(maxBytes = 4096)), state: value.state,
+      source: sanitizeText(value.source, plainTextPolicy(maxBytes = 4096)))
 
 proc apply*(chat: AgentChat, event: AgentEvent) =
   ## Applies one event on the UI thread, preserving stable IDs and versions.

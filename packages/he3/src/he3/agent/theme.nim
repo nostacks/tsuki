@@ -2,11 +2,29 @@
 
 import ../[style, theme]
 
-type AgentTheme* = object
-  base*: Theme
-  userLabel*: Style
-  thinkingLabel*: Style
-  lineNumber*: Style
+type
+  SyntaxTheme* = object
+    ## Token roles for highlighted source. Attribute-only themes keep every
+    ## role readable without color.
+    keyword*: Style
+    literal*: Style
+    comment*: Style
+    number*: Style
+    typeName*: Style
+    function*: Style
+    operator*: Style
+    attribute*: Style
+
+  AgentTheme* = object
+    base*: Theme
+    userLabel*: Style
+    thinkingLabel*: Style
+    lineNumber*: Style
+    link*: Style
+    math*: Style
+    caption*: Style
+    tableHeader*: Style
+    syntax*: SyntaxTheme
 
 func onCanvas*(s: Style): Style =
   ## Keeps foreground and attributes but releases the painted background, so
@@ -27,8 +45,25 @@ func deriveAgentTheme(base: Theme): AgentTheme =
   canvas.success = base.success.onCanvas
   canvas.code = base.code.onCanvas
   canvas.disabled = base.disabled.onCanvas
+  let colorful = canvas.accent.fg.kind == ckRgb
+  let dark = colorful and base == darkTheme()
+  var syntax = SyntaxTheme(
+    keyword: canvas.accent.withoutAttrs({attrBold}),
+    literal: canvas.success.withoutAttrs({attrBold}),
+    comment: canvas.muted.italic,
+    number: canvas.warning.withoutAttrs({attrBold}),
+    typeName: canvas.text.bold,
+    function: canvas.text,
+    operator: canvas.muted,
+    attribute: canvas.accent.withoutAttrs({attrBold}).italic)
+  if colorful:
+    syntax.typeName = fg(if dark: rgb(97, 196, 232) else: rgb(11, 108, 143))
+    syntax.function = fg(if dark: rgb(130, 170, 255) else: rgb(38, 79, 170))
   AgentTheme(base: canvas, userLabel: canvas.accent,
-    thinkingLabel: canvas.muted.italic, lineNumber: canvas.muted)
+    thinkingLabel: canvas.muted.italic, lineNumber: canvas.muted,
+    link: canvas.accent.withoutAttrs({attrBold}).underlined,
+    math: canvas.text.italic, caption: canvas.muted,
+    tableHeader: canvas.text.bold, syntax: syntax)
 
 const defaultAgentTheme = deriveAgentTheme(darkTheme())
 

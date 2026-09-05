@@ -95,10 +95,11 @@ config file, include:
 
 The `codex_app_server` provider supports ChatGPT subscription sign-in without
 asking Tsuki to store, copy, or parse OAuth credentials. Install the Codex CLI
-and make sure `codex` is on `PATH`, then run `/login`. Tsuki asks the supported
-Codex App Server for a device URL and one-time code; if device auth is not
-available, it falls back to the managed browser flow. Complete the flow in a
-browser while Tsuki waits. `/logout` signs out through the same managed API.
+and make sure `codex` is on `PATH`, then run `/provider` and press Enter on
+the ChatGPT entry. Tsuki asks the supported Codex App Server for a device URL
+and one-time code; if device auth is not available, it falls back to the
+managed browser flow. Complete the flow in a browser while Tsuki waits.
+Pressing Delete on the same entry signs out through the same managed API.
 
 ```json
 {
@@ -150,9 +151,14 @@ rest of the conversation unreadable.
 - Typing `/` opens a recommended-command popover. Up/Down moves, Tab or Enter
   completes the selected command, and Escape closes the popover without
   exiting. Submitting an exact command runs it.
+- The mouse wheel, PageUp, and PageDown scroll the transcript while the
+  composer keeps focus; Tab moves focus to the transcript so the arrow keys,
+  Home, and End scroll it too. A failure inside the shell restores the
+  terminal and prints the reason instead of leaving the screen behind.
 - `/new`, `/sessions`, `/resume <id>`, `/rename <title>` manage sessions.
-- `/provider` opens the sign-in dialog: ChatGPT device sign-in, or a masked
-  API key field for key-based providers. A rejected key reopens the field with
+- `/provider` opens the provider dialog: Enter starts ChatGPT device sign-in
+  or opens a masked API key field for key-based providers, and Delete signs
+  out of a ChatGPT entry. A rejected key reopens the field with
   the reason; an accepted key closes the dialog and confirms on the activity
   line. `/model` is the only place models are chosen, and a confirmed choice
   shows the same way. Ctrl-O opens the model dialog too.
@@ -174,7 +180,6 @@ rest of the conversation unreadable.
   button copies the selected text through OSC 52 when the terminal supports it
   and through the platform clipboard tool (`pbcopy`, `wl-copy`, `xclip`,
   `xsel`, or `clip`) when one is installed.
-- `/login` and `/logout` manage the ChatGPT Codex subscription account.
 - `/attach <path>` explicitly stages an image; `/detach [name]` removes it.
 - `/retry` creates a linked new attempt without deleting partial output.
 - `/help` lists commands; `/quit` saves, cancels, restores the terminal, and
@@ -196,11 +201,37 @@ and read only when the user submits.
 
 PNG, JPEG, and GIF signatures are accepted by the Phase 1 request adapter.
 Models that explicitly reject image input are blocked; unknown support produces
-a warning and remains provider-dependent. Headless, monochrome, Sixel, iTerm,
-and unverified Kitty sessions use a meaningful text attachment card. A bounded
-Kitty PNG encoder exists, but the executable does not claim inline preview
-until placement/scroll/resize/suspend/cleanup behavior has manual evidence in
-`manual-test.md`.
+a warning and remains provider-dependent.
+
+Inline previews: on terminals that advertise the kitty graphics protocol
+(kitty, Ghostty, WezTerm) or iTerm2 inline images, PNG attachments and
+Markdown images in assistant replies render inline in the transcript with a
+caption underneath; every other terminal, and any non-PNG file, shows the
+caption alone. Attachment previews may reference an explicit absolute path
+because the user staged it; Markdown image references are confined to the
+workspace by the same path policy as tools. Images are loaded once, kept in a
+bounded registry, transmitted to the terminal once, and re-placed as the
+transcript scrolls. While the transcript is moving, images are removed and
+placed again only once it has rested for 150 ms, which keeps fast wheel
+scrolling cheap for the terminal. Set `TSUKI_IMAGES=off` to disable inline
+images entirely and keep the captions. Placement, scroll, resize, and cleanup
+behavior has been exercised through a pseudo-terminal only; see
+`manual-test.md` for what has and has not been observed in a real emulator.
+
+## Rendering
+
+Assistant replies render through he3's incremental Markdown engine while
+they stream. Supported constructs: six heading levels, bold, italic, bold
+italic, strikethrough, inline code, links and bare URLs (emitted as OSC 8
+hyperlinks on terminals that support them), nested bullet, ordered, and task
+lists, block quotes, rules, tables laid out as a whole with a header row,
+alignment from the separator, and columns padded to their widest cell, images,
+fenced code with syntax highlighting for common languages, and LaTeX math.
+Inline `$...$` and display `$$` blocks render as Unicode text: Greek letters,
+operators, relations, sub- and superscripts, vulgar fractions, radicals,
+blackboard and script alphabets, accents, and simple matrices, with readable
+ASCII fallbacks for everything else. Tool output tagged with a language is
+highlighted the same way, and unified diffs keep their add and remove cues.
 
 ## Read-only tools and security boundary
 

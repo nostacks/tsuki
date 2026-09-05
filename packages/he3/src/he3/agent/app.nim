@@ -19,8 +19,6 @@ const agentCommands* = [
     description: "Start a durable session", recommended: true),
   SlashCommand(name: "/attach", usage: "/attach <path>",
     description: "Stage an image", recommended: true),
-  SlashCommand(name: "/login", usage: "/login",
-    description: "Sign in with ChatGPT", recommended: true),
   SlashCommand(name: "/help", usage: "/help",
     description: "Show commands and shortcuts", recommended: true),
   SlashCommand(name: "/retry", usage: "/retry",
@@ -30,11 +28,10 @@ const agentCommands* = [
   SlashCommand(name: "/rename", usage: "/rename <title>",
     description: "Rename this session"),
   SlashCommand(name: "/provider", usage: "/provider",
-    description: "Sign in or add a provider key"),
+    description: "Sign in, sign out, or add a provider key",
+    recommended: true),
   SlashCommand(name: "/detach", usage: "/detach [name]",
     description: "Remove a staged image"),
-  SlashCommand(name: "/logout", usage: "/logout",
-    description: "Sign out of ChatGPT"),
   SlashCommand(name: "/clear", usage: "/clear",
     description: "Clear the conversation and start fresh"),
   SlashCommand(name: "/quit", usage: "/quit",
@@ -74,6 +71,23 @@ type
 
   AgentActionProc* = proc (action: AgentAction) {.closure.}
 
+  ImageData* = object
+    ## PNG bytes and pixel size a host loader returns for an image source.
+    ## An empty `png` means the image is unavailable.
+    png*: string
+    widthPx*: int
+    heightPx*: int
+
+  ImageLoader* = proc (source: string): ImageData {.closure, gcsafe.}
+
+  ImageRegistryEntry = object
+    source: string
+    id: uint32
+    widthPx: int
+    heightPx: int
+    png: string
+    lastUse: uint64
+
   AgentFocus* = enum
     focusTranscript
     focusPrompt
@@ -100,6 +114,9 @@ type
     selectorEntries*: seq[SelectorEntry]
     authEntries*: seq[ProviderAuthEntry]
     sessionEntries*: seq[SessionPickerEntry]
+    imageLoader*: ImageLoader
+      ## Loads PNG bytes for transcript image sources. Nil keeps every image
+      ## as its text fallback. Hosts apply their own path policy inside it.
 
   AgentUiState* = object
     transcript*: TranscriptState
@@ -119,10 +136,15 @@ type
     quitArmed*: bool
     quitArmedAt*: MonoTime
     commandPopover: Rect
+    images: seq[ImageRegistryEntry]
+    nextImageId: uint32
+    imageClock: uint64
 
 const
   quitConfirmWindow* = initDuration(seconds = 2)
   toastDuration* = initDuration(milliseconds = 3500)
+  imageSettle* = initDuration(milliseconds = 150)
+  maxRegisteredImages = 16
 
 func quitConfirmActive*(state: AgentUiState, now: MonoTime): bool =
   ## True while the double-ctrl-c exit confirmation is still pending.
@@ -132,13 +154,14 @@ func agentTuiOptions*(tui = tuiOptions(mouse = true), colors = agentTheme(),
     promptHeight = 3, showPlan = true, reducedMotion = false,
     status = AgentStatus(), selectorEntries: seq[SelectorEntry] = @[],
     authEntries: seq[ProviderAuthEntry] = @[],
-    sessionEntries: seq[SessionPickerEntry] = @[]): AgentTuiOptions =
+    sessionEntries: seq[SessionPickerEntry] = @[],
+    imageLoader: ImageLoader = nil): AgentTuiOptions =
   ## Creates sensible agent-shell defaults without choosing a model transport.
   AgentTuiOptions(tui: tui, colors: colors,
     promptHeight: max(1, promptHeight), showPlan: showPlan,
     reducedMotion: reducedMotion, status: status,
     selectorEntries: selectorEntries, authEntries: authEntries,
-    sessionEntries: sessionEntries)
+    sessionEntries: sessionEntries, imageLoader: imageLoader)
 
 proc initAgentUiState*(): AgentUiState =
   ## Shell state with the safe approval default selected and the built-in
@@ -515,6 +538,10 @@ proc handleOverlayEvent*(chat: AgentChat, state: var AgentUiState,
       state.overlay = overlayNone
       return ShellOutcome(effect: seHostAction, changed: true,
         actionKind: aaLogin, argument: outcome.entry.providerId)
+    of paDeviceLogout:
+      state.overlay = overlayNone
+      return ShellOutcome(effect: seHostAction, changed: true,
+        actionKind: aaLogout, argument: outcome.entry.providerId)
     of paKeySubmitted:
       return ShellOutcome(effect: seHostAction, changed: true,
         actionKind: aaApiKey,
@@ -588,9 +615,8 @@ proc runShellCommand*(chat: AgentChat, state: var AgentUiState,
       "/sessions  browse saved sessions\n" &
       "/resume [id]  resume an exact session, or open the picker\n" &
       "/rename <title>  rename this session\n" &
-      "/provider  sign in or add a provider API key\n" &
+      "/provider  sign in, sign out, or add a provider API key\n" &
       "/model  choose any provider and model\n" &
-      "/login, /logout  manage ChatGPT subscription sign-in\n" &
       "/attach <path>, /detach [name]  stage or remove an image\n" &
       "/retry  retry the last user turn\n" &
       "/clear  clear the conversation and start a fresh session\n" &
@@ -639,10 +665,6 @@ proc runShellCommand*(chat: AgentChat, state: var AgentUiState,
       actionKind: aaDetach, argument: argument)
   of "/retry":
     ShellOutcome(effect: seHostAction, changed: true, actionKind: aaRetry)
-  of "/login":
-    ShellOutcome(effect: seHostAction, changed: true, actionKind: aaLogin)
-  of "/logout":
-    ShellOutcome(effect: seHostAction, changed: true, actionKind: aaLogout)
   else:
     chat.apply notice("unknown", "Unknown command: " & sanitizeText(name) &
       "\n/help lists commands")
@@ -759,7 +781,7 @@ proc handleShellEvent*(chat: AgentChat, state: var AgentUiState,
     of promptChanged:
       return ShellOutcome(effect: seNone, changed: true)
     of promptIgnored:
-      return ShellOutcome(effect: seNone, changed: false)
+      discard
   return ShellOutcome(effect: seNone,
     changed: state.transcript.transcriptEvent(chat, event))
 
@@ -788,21 +810,75 @@ proc runAgentTui*(chat: AgentChat, onAction: AgentActionProc,
   var state = initAgentUiState()
   state.transcript.scroll.anchor = anchorEnd
   chat.attach(app.ui.reactor)
+
+  proc resolveImage(source: string): ImageInfo =
+    ## Loads each source once, registers it with the terminal session, and
+    ## keeps a bounded least-recently-used registry so a long transcript
+    ## cannot pin unlimited image data.
+    if options.imageLoader.isNil or app.ui.imageProtocol == imageOutNone:
+      return
+    inc state.imageClock
+    for entry in state.images.mitems:
+      if entry.source == source:
+        entry.lastUse = state.imageClock
+        return ImageInfo(id: entry.id, widthPx: entry.widthPx,
+          heightPx: entry.heightPx)
+    var loaded: ImageData
+    try:
+      loaded = options.imageLoader(source)
+    except CatchableError:
+      loaded = ImageData()
+    if state.images.len >= maxRegisteredImages:
+      var oldest = 0
+      for index in 1 ..< state.images.len:
+        if state.images[index].lastUse < state.images[oldest].lastUse:
+          oldest = index
+      if state.images[oldest].id != 0:
+        app.ui.forgetImage(state.images[oldest].id)
+      state.images.delete(oldest)
+    var entry = ImageRegistryEntry(source: source, lastUse: state.imageClock)
+    if loaded.png.len > 0 and loaded.widthPx > 0 and loaded.heightPx > 0:
+      inc state.nextImageId
+      if state.nextImageId == 0: inc state.nextImageId
+      entry.id = state.nextImageId
+      entry.png = loaded.png
+      entry.widthPx = loaded.widthPx
+      entry.heightPx = loaded.heightPx
+      app.ui.registerImage(entry.id, entry.png, entry.widthPx, entry.heightPx)
+    state.images.add entry
+    ImageInfo(id: entry.id, widthPx: entry.widthPx, heightPx: entry.heightPx)
+
+  state.transcript.imageResolver = resolveImage
   var spinnerTimer = TimerId(0)
   var redrawTimer = TimerId(0)
   var quitTimer = TimerId(0)
   var toastTimer = TimerId(0)
+  var settleTimer = TimerId(0)
   var lastDraw = MonoTime()
+  var lastScroll = getMonoTime() - imageSettle
+  var lastOffset = state.transcript.scroll.offsetY
 
   proc drawShell(frame: var Frame) =
     frame.drawAgentShell(chat, state, options)
 
   proc drawNow() =
+    ## Draws one frame. While the transcript offset keeps changing, image
+    ## placements are deferred and a settle timer draws them once it rests.
     if uint64(redrawTimer) != 0:
       discard app.cancelTimer(redrawTimer)
       redrawTimer = TimerId(0)
+    let now = getMonoTime()
+    if state.transcript.scroll.offsetY != lastOffset:
+      lastScroll = now
+    app.ui.w.deferPlacements = now - lastScroll < imageSettle
     app.draw(drawShell)
-    lastDraw = getMonoTime()
+    if state.transcript.scroll.offsetY != lastOffset:
+      lastScroll = now
+      lastOffset = state.transcript.scroll.offsetY
+    if app.ui.w.deferPlacements or now - lastScroll < imageSettle:
+      if uint64(settleTimer) == 0:
+        settleTimer = app.ui.reactor.setTimerAt(lastScroll + imageSettle)
+    lastDraw = now
 
   proc requestDraw() =
     ## Coalesces streaming bursts against the configured frame ceiling while
@@ -829,9 +905,13 @@ proc runAgentTui*(chat: AgentChat, onAction: AgentActionProc,
       if event.kind == evTimer and uint64(redrawTimer) != 0 and
           event.timerId == uint64(redrawTimer):
         redrawTimer = TimerId(0)
-        app.draw(drawShell)
-        lastDraw = getMonoTime()
+        drawNow()
         scheduleSpinner(app, chat, options, spinnerTimer)
+        continue
+      if event.kind == evTimer and uint64(settleTimer) != 0 and
+          event.timerId == uint64(settleTimer):
+        settleTimer = TimerId(0)
+        if app.running: requestDraw()
         continue
       if event.kind == evTimer and uint64(spinnerTimer) != 0 and
           event.timerId == uint64(spinnerTimer):
@@ -879,11 +959,16 @@ proc runAgentTui*(chat: AgentChat, onAction: AgentActionProc,
         redrawTimer = TimerId(0)
         quitTimer = TimerId(0)
         toastTimer = TimerId(0)
+        settleTimer = TimerId(0)
         state.quitArmed = false
         if not suspended.ok:
           raise newException(IOError, suspended.error)
         if suspended.value:
           chat.attach(app.ui.reactor)
+          for entry in state.images:
+            if entry.id != 0:
+              app.ui.registerImage(entry.id, entry.png, entry.widthPx,
+                entry.heightPx)
           drawNow()
       of seApproval:
         chat.pendingApproval = ApprovalRequest()
@@ -967,3 +1052,10 @@ proc runAgentTui*(chat: AgentChat, onAction: AgentActionProc,
     except CatchableError: discard
     TuiResult[RunStats](ok: false,
       error: "agent TUI failed: " & failure.msg)
+  except Defect as failure:
+    chat.attach(nil)
+    try: app.close()
+    except CatchableError: discard
+    TuiResult[RunStats](ok: false,
+      error: "agent TUI hit a defect: " & failure.msg &
+        "\n" & failure.getStackTrace())

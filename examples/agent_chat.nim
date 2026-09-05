@@ -73,7 +73,7 @@ proc handleAction(action: AgentAction) =
       "persistent workspace sessions.")
   of aaLogin, aaLogout:
     discard chat.post notice("authentication", "The public mock example does " &
-      "not connect to an account. Use the tsuki executable for /login.")
+      "not connect to an account. Use the tsuki executable for /provider.")
   of aaApproval, aaCopy:
     discard
 

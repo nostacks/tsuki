@@ -111,10 +111,38 @@ Automated on the macOS development host on 2026-09-02:
 - recommended slash-command popover rendering, non-color selection marker,
   arrow traversal, Enter completion, and non-quitting Escape behavior.
 
-No GUI terminal was available to verify Kitty placement lifecycle or iTerm
-inline images during this implementation. The executable therefore keeps text
-fallback as its supported behavior and makes no new inline-image compatibility
-claim. A public OpenAI-compatible endpoint smoke test remains opt-in and
+Automated on the macOS development host on 2026-09-06:
+
+- cell hyperlinks: OSC 8 open and close around exactly the linked cells,
+  suppression without the capability, and rejection of URIs carrying control
+  bytes, through the fake output sink;
+- image placements: kitty transmit once, placement by cursor with `C=1`,
+  cropped source rectangles for edge-cut boxes, deletion by placement id,
+  iTerm2 inline payloads, cell repaint beneath removed iTerm images, no
+  output without a protocol, and delete-all on full repaint;
+- Markdown, math, highlighting, and image-box layout through headless
+  transcripts, including scroll cropping and text fallback without a
+  resolver;
+- a temporary seeded session under a Python pseudo-terminal with
+  `TERM=xterm-kitty`: the transcript drew, a prompt streamed a reply, paging
+  scrolled, `/quit` restored the alternate screen, and the byte stream
+  contained kitty transmits, placements, deletions, OSC 8 links, and
+  synchronized-output frames; a 45 second randomized session (wheel bursts,
+  paging, resizes to six sizes, drags, typed prompts, a synthetic graphics
+  reply) against a debug build ran without a defect at about 7 percent CPU,
+  and a resting run showed images placed once after scrolling settled. The
+  seeded session was a development aid and is not part of the executable.
+
+A hands-on WezTerm run during that work reported a crash after a few wheel
+movements, lag, and misaligned tables. The table layout was rewritten, the
+parser now swallows terminal reply strings, image placement is deferred while
+scrolling, and a defect now restores the terminal and prints its message; a
+second hands-on run was reported as much better.
+
+No GUI terminal was available to observe the resulting pixels. Inline images
+and OSC 8 links are therefore verified at the byte level only; how kitty,
+Ghostty, WezTerm, or iTerm2 actually paint, scroll, and clear them is not
+recorded, and Sixel is not emitted at all. A public OpenAI-compatible endpoint smoke test remains opt-in and
 requires an environment-supplied credential; the automated transport fixture
 uses loopback only, and no public service was contacted by the default gate.
 Live OpenRouter and ChatGPT subscription requests are likewise not recorded as

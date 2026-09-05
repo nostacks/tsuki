@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Rendering: he3 cells carry hyperlinks emitted as OSC 8, frames can place
+  images through the kitty graphics protocol or iTerm2 inline images with
+  once-only transmission and diffed placements, the Markdown engine gained
+  nested and ordered lists, six heading levels, strikethrough, autolinks,
+  tables with header padding, images, syntax highlighting for fenced code
+  and tool output, LaTeX math rendered as Unicode, whole-table layout with
+  alignment, terminal reply strings swallowed by the input parser, and image
+  placement deferred while scrolling. `/login` and `/logout` were folded
+  into `/provider` (Enter signs in, Delete signs out).
 - Extracted he3 into its own Nimble package at `packages/he3`. The import
   path is now `he3` (`he3/agent`, `he3/expert`, `he3/protocols/...`) instead
   of `tsuki/tui`, its tests and benchmarks live under the package, the root

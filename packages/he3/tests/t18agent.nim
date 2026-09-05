@@ -679,7 +679,7 @@ proc testAgentShell =
     var commandHarness = initHeadlessTui(80, 24)
     let commandFrame = commandHarness.drawShell(chat, state, options)
     check commandFrame.contains("Recommended commands") and
-      commandFrame.contains("Sign in with ChatGPT"),
+      commandFrame.contains("Sign in, sign out, or add a provider key"),
       "a leading slash opens the concise recommended command popover"
     check commandFrame.contains("↑↓ move") and commandFrame.contains("›"),
       "the popover exposes keyboard help and a non-color selection marker"
@@ -710,8 +710,9 @@ proc testAgentShell =
     state.prompt.completionDismissed = false
     let login = handleShellEvent(chat, state,
       Event(kind: evKey, key: initKey(kcEnter)))
-    check login.effect == seHostAction and login.actionKind == aaLogin,
-      "the ChatGPT login command reaches the host only when submitted exactly"
+    check login.effect == seNone and login.changed and
+      chat.items[^1].content.contains("Unknown command: /login"),
+      "sign-in has no dedicated command and is reached through /provider"
 
   block wide120x32:
     let chat = seededShellChat()
@@ -1080,10 +1081,10 @@ proc testPhase1Views =
     var harness = initHeadlessTui(80, 24)
     state.overlay = overlayProviders
     let opened = harness.drawShell(chat, state, options)
-    check opened.contains("Provider sign-in") and
-      opened.contains("enter to sign in") and
+    check opened.contains("Providers") and
+      opened.contains("enter to sign in · del to sign out") and
       opened.contains("enter to add API key"),
-      "the provider dialog offers only sign-in actions"
+      "the provider dialog offers sign-in, sign-out, and key actions"
     check opened.contains("or set OPENAI_API_KEY"),
       "missing keys still name their environment variable"
     discard handleOverlayEvent(chat, state, options,
@@ -1149,6 +1150,22 @@ proc testPhase1Views =
       state.overlay == overlayNone,
       "enter on a device provider requests its sign-in and closes the dialog"
     state.overlay = overlayProviders
+    state.auth = ProviderAuthUi()
+    let signOut = handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcDelete)))
+    check signOut.effect == seHostAction and
+      signOut.actionKind == aaLogout and signOut.argument == "chatgpt" and
+      state.overlay == overlayNone,
+      "delete on a device provider requests its sign-out and closes the dialog"
+    state.overlay = overlayProviders
+    state.auth = ProviderAuthUi()
+    discard handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcDown)))
+    let keyDelete = handleOverlayEvent(chat, state, options,
+      Event(kind: evKey, key: initKey(kcDelete)))
+    check keyDelete.effect == seNone and not keyDelete.changed and
+      state.overlay == overlayProviders,
+      "delete does nothing on an API key provider"
     let cancelled = handleOverlayEvent(chat, state, options,
       Event(kind: evKey, key: initKey(kcEscape)))
     check cancelled.changed and state.overlay == overlayNone,
@@ -1305,8 +1322,242 @@ proc testContextStatus =
   check harness.snapshot.endsWith("ctx ?") and '\e' notin harness.snapshot,
     "unknown capacity stays explicit and directory controls are sanitized"
 
+proc spanTexts(line: Line): seq[string] =
+  for span in line.spans: result.add span.text
+
+proc testRichMarkdown =
+  let doc = parseMarkdown("""# Title
+## Sub *heading*
+Text with **bold**, *italic*, ***both***, ~~gone~~, `code`, a [link](https://example.com), and https://nim-lang.org.
+1. first
+2. second
+   - nested bullet
+   - [x] done task
+> quoted **strong**
+> > deeper
+| Name | Value |
+|:-----|------:|
+| pi | 3.14 |
+$$
+\int_a^b f(x) dx
+$$
+Inline $a^2 + b^2 = c^2$ here, price $5 and $10.
+![A plot](memory:plot)
+```nim
+proc greet*(name: string): string =
+  result = "hi " & name  # trailing
+```
+----
+""")
+  let colors = agentTheme()
+  check doc.lines[0].spans[0].style == colors.base.accent.bold.underlined,
+    "a level one heading is accented, bold, and underlined"
+  check doc.lines[1].spanTexts == @["Sub ", "heading"] and
+    doc.lines[1].spans[1].style == colors.base.accent.bold.italic,
+    "inline emphasis nests inside headings and keeps the plain prefix"
+  let mixed = doc.lines[2]
+  check mixed.spanTexts[0] == "Text with " and
+    mixed.spans[1].style == colors.base.text.bold and
+    mixed.spans[3].style == colors.base.text.italic and
+    mixed.spans[5].style == colors.base.text.bold.italic and
+    attrStrikethrough in mixed.spans[7].style.attrs,
+    "bold, italic, bold italic, and strikethrough each get their style"
+  var links: seq[string]
+  for span in mixed.spans:
+    if span.hyperlink.uri.len > 0: links.add span.hyperlink.uri
+  check links == @["https://example.com", "https://nim-lang.org"],
+    "explicit links and bare URLs both carry their URI"
+  check doc.lines[3].spanTexts == @["1. ", "first"] and
+    doc.lines[5].spanTexts == @["  ", "◦ ", "nested bullet"] and
+    doc.lines[6].spanTexts == @["  ", "☑ ", "done task"],
+    "ordered, nested, and task list items keep their cues and depth"
+  check doc.lines[7].spanTexts == @["│ ", "quoted ", "strong"] and
+    doc.lines[8].spanTexts[0] == "│ │ ",
+    "block quotes nest with one bar per level"
+  check doc.lines[9].spans[0].style == colors.tableHeader and
+    doc.lines[10].spanTexts == @["─────┼──────"] and
+    doc.lines[11].spanTexts == @["pi  ", " │ ", " 3.14"],
+    "the first table row is the header, the separator becomes a rule, " &
+    "and body cells pad to the column width with its alignment"
+  let wide = parseMarkdown("| a | b |\n|:-:|--:|\n| **longer** | 1 |\n| x | 12 |")
+  check wide.lines[0].spanTexts.join == "  a    │  b" and
+    wide.lines[1].spanTexts.join == "───────┼───" and
+    wide.lines[2].spanTexts.join == "longer │  1" and
+    wide.lines[3].spanTexts.join == "  x    │ 12",
+    "columns take the widest rendered cell and honor center and right"
+  check doc.lines[12].spanTexts == @["  ∫ₐᵇ f(x) dx"] and
+    doc.lines[12].spans[0].style == colors.math,
+    "display math renders on its own indented line"
+  check doc.lines[13].spanTexts == @["Inline ", "a² + b² = c²",
+    " here, price $5 and $10."],
+    "inline math renders and lone dollar amounts stay text"
+  check doc.lines[14].image == ImageRef(source: "memory:plot",
+    alt: "A plot") and doc.lines[14].spanTexts == @["▣ A plot"],
+    "an image paragraph records its source with a text fallback"
+  check doc.lines[15].spanTexts == @["Code · nim"], "fences keep the label"
+  let code = doc.lines[16]
+  check code.spans[0].text == "proc" and
+    code.spans[0].style == colors.syntax.keyword and
+    code.spans[2].text == "greet" and
+    code.spans[2].style == colors.syntax.function,
+    "fenced Nim highlights keywords and calls"
+  var sawString, sawComment: bool
+  for span in doc.lines[17].spans:
+    if span.text == "\"hi \"" and span.style == colors.syntax.literal:
+      sawString = true
+    if span.text == "# trailing" and span.style == colors.syntax.comment:
+      sawComment = true
+  check sawString and sawComment, "strings and comments are highlighted"
+  check doc.lines[18].spans[0].style == colors.base.border,
+    "a four dash rule still draws a rule"
+  check parseMarkdown("no *emph* \\*literal\\* and snake_case_name").lines[0]
+    .spanTexts == @["no ", "emph", " *literal* and snake_case_name"],
+    "escapes and intraword underscores never open emphasis"
+
+proc testMathRendering =
+  check renderMath("E = mc^2") == "E = mc²", "superscripts map to Unicode"
+  check renderMath("\\sum_{i=1}^{n} x_i^2") == "∑ᵢ₌₁ⁿ xᵢ²",
+    "sums carry mapped sub and superscripts"
+  check renderMath("\\frac{1}{2} + \\frac{a+b}{c}") == "½ + (a+b)/c",
+    "fractions use vulgar forms or parenthesised slashes"
+  check renderMath("\\int_0^\\infty e^{-x^2} dx") == "∫₀^∞ e^(-x²) dx",
+    "a command as a script argument consumes only itself"
+  check renderMath("\\sqrt{x^2 + y^2}") == "√(x² + y²)" and
+    renderMath("\\sqrt{2}") == "√2̅", "radicals overline simple content"
+  check renderMath("\\mathbb{R}^n \\subseteq \\mathcal{H}") == "ℝⁿ ⊆ ℋ",
+    "blackboard and script alphabets map letter by letter"
+  check renderMath("\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}") ==
+    "(a   b; c   d)", "matrices render row by row inside their brackets"
+  check renderMath("\\hat{x} + \\vec{v}") == "x̂ + v⃗",
+    "accents become combining marks"
+  check '\e' notin renderMath("\\alpha\e]52;c;owned\a") and
+    "owned" in renderMath("\\alpha\e]52;c;owned\a"),
+    "control bytes never survive math rendering"
+  check renderMath(repeat("{", 100) & "x" & repeat("}", 100)) == "x",
+    "deep nesting stays bounded"
+
+proc testHighlighting =
+  let colors = agentTheme()
+  var state: HighlightState
+  let first = highlightLine("let x = 42; /* open", "c", state, colors)
+  check first.spans[^1].text == "/* open" and
+    first.spans[^1].style == colors.syntax.comment,
+    "an unterminated block comment colors the rest of the line"
+  let second = highlightLine("still */ return x;", "c", state, colors)
+  check second.spans[0].text == "still */" and
+    second.spans[0].style == colors.syntax.comment and
+    second.spans[2].text == "return" and
+    second.spans[2].style == colors.syntax.keyword,
+    "the comment state carries to the next line and then closes"
+  let py = highlightLine("def area(r): return 3.14 * r ** 2  # pi", "python",
+    state, colors)
+  var kinds: seq[string]
+  for span in py.spans:
+    if span.style == colors.syntax.keyword: kinds.add "kw:" & span.text
+    elif span.style == colors.syntax.number: kinds.add "num:" & span.text
+    elif span.style == colors.syntax.function: kinds.add "fn:" & span.text
+    elif span.style == colors.syntax.comment: kinds.add "cm:" & span.text
+  check kinds == @["kw:def", "fn:area", "kw:return", "num:3.14", "num:2",
+    "cm:# pi"], "python keywords, calls, numbers, and comments are found"
+  check not knownLanguage("brainfuck") and knownLanguage("TypeScript"),
+    "language lookup is case insensitive and honest about unknowns"
+  let plain = highlightLine("anything at all", "brainfuck", state, colors)
+  check plain.spans.len == 1 and plain.spans[0].style == colors.base.code,
+    "unknown languages stay in the plain code style"
+
+proc testTranscriptImagesAndLinks =
+  let chat = initAgentChat()
+  chat.apply userMessage("u1", "see the plot", @[Attachment(id: "a1",
+    name: "plot.png", mediaType: "image/png", sizeBytes: 2048, width: 400,
+    height: 200, state: attachmentViewReady, source: "/tmp/plot.png")])
+  chat.apply messageDelta("t1", "Docs: [guide](https://example.com/guide)\n" &
+    "![Sine](memory:sine)\nAfter the image.")
+  var harness = initHeadlessTui(60, 40)
+  var state: TranscriptState
+  var requested: seq[string]
+  state.imageResolver = proc (source: string): ImageInfo =
+    requested.add source
+    if source == "memory:sine":
+      ImageInfo(id: 7, widthPx: 320, heightPx: 160)
+    elif source == "/tmp/plot.png":
+      ImageInfo(id: 9, widthPx: 400, heightPx: 200)
+    else:
+      ImageInfo()
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  state.scroll.anchor = anchorStart
+  state.scroll.offsetY = 0
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  let rows = harness.snapshot.split('\n')
+  check requested.contains("memory:sine") and
+    requested.contains("/tmp/plot.png"),
+    "the resolver is asked for markdown images and attachments"
+  check harness.buffer.images.len == 2, "both images are placed"
+  var attachment, markdown: ImagePlacement
+  for placement in harness.buffer.images:
+    if placement.imageId == 9: attachment = placement
+    if placement.imageId == 7: markdown = placement
+  check attachment.cols == 40 and attachment.rows == 10 and
+    attachment.rect.x == 2 and attachment.rect.y == 1,
+    "an attachment preview sits below the user text at the body inset"
+  check markdown.cols == 32 and markdown.rows == 8,
+    "a markdown image box follows the ten pixel per column rule"
+  check rows[attachment.rect.y + attachment.rows].contains(
+    "Attachment: plot.png"),
+    "the attachment caption sits directly under its image"
+  check rows[markdown.rect.y + markdown.rows].contains("▣ Sine") and
+    rows[markdown.rect.y + markdown.rows + 1].contains("After the image."),
+    "the markdown caption and the following paragraph keep their order"
+  var linked = 0
+  for y in 0 ..< harness.buffer.height:
+    for x in 0 ..< harness.buffer.width:
+      let cell = harness.buffer.cellAt(x, y)
+      if cell.link != 0 and harness.buffer.linkUri(cell.link) ==
+          "https://example.com/guide":
+        inc linked
+  check linked == 5, "exactly the link label cells carry the URI"
+  harness.resize(60, 12)
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  state.scroll.scrollBy(0, -(state.scroll.maxOffsetY - (attachment.rect.y + 3)))
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, state)
+  var cut: ImagePlacement
+  for placement in harness.buffer.images:
+    if placement.imageId == 9: cut = placement
+  check cut.rect.y == 0 and cut.offsetY == 3 and cut.rect.height == 7,
+    "an image scrolled past the top keeps its cropped placement"
+  var plain: TranscriptState
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, plain)
+  plain.scroll.anchor = anchorStart
+  plain.scroll.offsetY = 0
+  harness.draw proc (frame: var Frame) =
+    frame.transcript(chat, plain)
+  check harness.buffer.images.len == 0 and
+    harness.snapshot.contains("▣ Sine") and
+    harness.snapshot.contains("Attachment: plot.png"),
+    "without a resolver images fall back to their captions"
+
+proc testStreamingRichMarkdown =
+  let source = "Intro with **bold *nested*** and $x^2$\n| a | b |\n|---|---|\n" &
+    "| 1 | 2 |\n1. one\n  - two\n```python\nx = \"\"\"open\nstill\"\"\"\n```\n" &
+    "![alt](img)\n$$\n\\frac{1}{2}\n$$\ntail"
+  let expected = parseMarkdown(source)
+  var streamed = initMarkdownState()
+  for byteIndex in 0 ..< source.len:
+    streamed.feed(source[byteIndex .. byteIndex])
+  check streamed.finish().lines == expected.lines,
+    "rich markdown streams byte by byte to the one-shot result"
+
 testContextStatus()
 testStreamingMarkdown()
+testRichMarkdown()
+testMathRendering()
+testHighlighting()
+testTranscriptImagesAndLinks()
+testStreamingRichMarkdown()
 testAgentModel()
 testTranscriptAndApproval()
 testTranscriptViewport()

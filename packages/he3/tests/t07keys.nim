@@ -143,10 +143,35 @@ proc testModeReports =
   check split.pending == 0 and split.syncOutputSupported and events.len == 0,
     "the split reply resolves once complete"
 
+proc testStringReplies =
+  var state = initParseState()
+  var events: seq[Event]
+  state.parse(cast[seq[byte]]("\e_Gi=1,p=3;OK\e\\a"), events)
+  check events.len == 1 and events[0].key.isChar('a'),
+    "a kitty graphics reply is swallowed and the next key survives"
+  events.setLen 0
+  state.parse(cast[seq[byte]]("\e]52;c;Zm9v\ab"), events)
+  check events.len == 1 and events[0].key.isChar('b'),
+    "a BEL-terminated OSC reply is swallowed"
+  events.setLen 0
+  state.parse(cast[seq[byte]]("\eP1$r0 q\e"), events)
+  check events.len == 0 and state.pending > 0,
+    "a split DCS reply waits for its terminator"
+  state.parse(cast[seq[byte]]("\\c"), events)
+  check events.len == 1 and events[0].key.isChar('c'),
+    "the terminator completes the reply"
+  events.setLen 0
+  state.parse(cast[seq[byte]]("\e]"), events)
+  check events.len == 0, "a lone introducer waits for more bytes"
+  state.checkDeadline(events, getMonoTime() + initDuration(seconds = 2))
+  check events.len == 1 and events[0].key.isChar(']', {modAlt}),
+    "an introducer that never completes becomes its alt key"
+
 proc main =
   runCorpusFile("tests/corpora/legacy.txt")
   testHostileInput()
   testModeReports()
+  testStringReplies()
   echo "keys ok"
 
 main()

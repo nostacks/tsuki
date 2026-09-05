@@ -26,8 +26,10 @@ func be32(data: string, offset: int): int =
 func le16(data: string, offset: int): int =
   ord(data[offset]) or (ord(data[offset + 1]) shl 8)
 
-proc imageMetadata(data: string, mediaType: var string,
+proc imageMetadata*(data: string, mediaType: var string,
     width, height: var int): string =
+  ## Reads the media type and pixel size from a bounded image header.
+  ## Returns an error message for unsupported or corrupt signatures.
   if data.len >= 24 and data[0 ..< 8] == "\x89PNG\r\n\x1a\n":
     mediaType = "image/png"
     width = data.be32(16)

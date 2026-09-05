@@ -149,7 +149,7 @@ proc startConnection(adapter: CodexAppServerProvider,
   let executable = adapter.resolvedExecutable
   if executable.len == 0:
     result.error = ProviderError(kind: providerConfiguration,
-      message: "Codex CLI was not found. Install Codex, then use /login.")
+      message: "Codex CLI was not found. Install Codex, then use /provider.")
     return
   try:
     let process = startProcess(executable, workingDir = workingDir,
@@ -359,7 +359,7 @@ proc newCodexAppServerProvider*(id = ProviderId("chatgpt"),
 method validate*(adapter: CodexAppServerProvider): ProviderError {.gcsafe.} =
   if adapter.resolvedExecutable.len == 0:
     ProviderError(kind: providerConfiguration,
-      message: "Codex CLI was not found. Install Codex, then use /login.")
+      message: "Codex CLI was not found. Install Codex, then use /provider.")
   else:
     ProviderError()
 
@@ -385,12 +385,12 @@ method refreshModels*(adapter: CodexAppServerProvider,
   let accountNode = account.node{"result"}{"account"}
   if accountNode.isNil or accountNode.kind == JNull:
     result.error = ProviderError(kind: providerAuthentication,
-      message: "Sign in with ChatGPT using /login to load Codex models.")
+      message: "Sign in with ChatGPT using /provider to load Codex models.")
     return
   if accountNode{"type"}.getStr != "chatgpt":
     result.error = ProviderError(kind: providerAuthentication,
       message: "The Codex CLI is not signed in with a ChatGPT subscription. " &
-        "Use /login to switch accounts.")
+        "Use /provider to switch accounts.")
     return
   var cursor = ""
   var pages = 0

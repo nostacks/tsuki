@@ -37,18 +37,21 @@ proc applyScrollHint(prev, next: var Buffer, w: var Out, cur: var Style,
     w.setStyle(cur, haveCur, def)
   w.frame.addScrollRegion(region.y + 1, region.y + region.height, hint.rows)
   prev.scrollRows(region.y, region.height, hint.rows)
+  w.invalidateImages(region)
 
 proc diffInto*(prev, next: var Buffer, w: var Out) =
   ## Emits the minimal byte stream turning the `prev` frame into `next`:
   ## one cursor move per changed run, style changes inline, trailing blank
   ## runs collapsed into an erase-to-end-of-line. An unchanged frame performs
   ## no write at all. A scroll hint on `next` may move rows with a terminal
-  ## scroll first when the output sink allows scroll regions.
+  ## scroll first when the output sink allows scroll regions. Hyperlinks and
+  ## image placements follow the cells when the sink advertises them.
   let def = styleDefault()
   w.beginFrame()
   var cur = w.curStyle
   var haveCur = w.curValid
   applyScrollHint(prev, next, w, cur, haveCur)
+  w.removeStaleImages(prev, next.images)
   let sameWidth = prev.width == next.width
   let wd = min(prev.width, next.width)
   let h = min(prev.height, next.height)
@@ -75,6 +78,7 @@ proc diffInto*(prev, next: var Buffer, w: var Out) =
         if x >= contentEnd:
           if not haveCur or cur != def:
             w.setStyle(cur, haveCur, def)
+          w.closeLink()
           w.frame.addSeq "\x1b[K"
           x = next.width
           break
@@ -84,8 +88,12 @@ proc diffInto*(prev, next: var Buffer, w: var Out) =
           continue
         if not haveCur or c.style != cur:
           w.setStyle(cur, haveCur, c.style)
+        if c.link != 0 or w.hasOpenLink:
+          w.setLink(next, c.link)
         w.frame.appendGlyphBytes(next, c)
         inc x, max(1, c.cellWidth)
+  w.closeLink()
+  w.placeImages(next.images)
   w.curStyle = cur
   w.curValid = true
   w.endFrame()

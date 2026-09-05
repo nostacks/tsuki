@@ -18,6 +18,21 @@ type
     displayWidth*: uint8
     glyphOffset*: uint32
     glyphLen*: uint16
+    link*: uint16
+      ## One-based index into the owning buffer's link table; zero means the
+      ## cell carries no hyperlink.
+
+  ImagePlacement* = object
+    ## An image drawn over a block of cells. `rect` is the visible part in
+    ## buffer cells; `cols` and `rows` give the whole image's cell box and
+    ## `offsetX`/`offsetY` say which corner of that box `rect` starts at, so
+    ## a renderer can crop an image cut by an edge.
+    imageId*: uint32
+    rect*: Rect
+    cols*: int
+    rows*: int
+    offsetX*: int
+    offsetY*: int
 
   ScrollHint* = object
     ## A renderer hint that the rows of `region` moved by `rows` since the
@@ -35,6 +50,14 @@ type
     widthPolicy*: WidthPolicy
     scrollHint*: ScrollHint
     scrollHintConflict*: bool
+    links*: seq[string]
+      ## Hyperlink URIs referenced by `Cell.link`. Reset with the buffer.
+    images*: seq[ImagePlacement]
+      ## Image placements requested for this frame, in drawing order.
+
+const
+  maxLinksPerFrame = 1024
+  maxLinkBytes = 2048
 
 static:
   doAssert sizeof(Cell) <= 24, "Cell must stay cache-friendly"
@@ -60,7 +83,7 @@ func `==`*(a, b: Cell): bool =
   ## arena offsets are meaningful only within the owning buffers.
   a.rune == b.rune and a.style == b.style and a.wideTail == b.wideTail and
     a.displayWidth == b.displayWidth and a.glyphOffset == b.glyphOffset and
-    a.glyphLen == b.glyphLen
+    a.glyphLen == b.glyphLen and a.link == b.link
 
 func initBuffer*(w, h: int, widthPolicy = WidthPolicy()): Buffer =
   ## Creates a nonnegative `w` by `h` blank buffer.
@@ -93,13 +116,28 @@ func glyphBytesEqual(a: Buffer, ac: Cell, b: Buffer, bc: Cell): bool =
       return false
   true
 
+func linkUri*(b: Buffer, link: uint16): string =
+  ## Returns the URI a cell link refers to, or "" for no link.
+  if link == 0 or int(link) > b.links.len: ""
+  else: b.links[int(link) - 1]
+
+func sameLink(a: Buffer, al: uint16, b: Buffer, bl: uint16): bool =
+  let aValid = al != 0 and int(al) <= a.links.len
+  let bValid = bl != 0 and int(bl) <= b.links.len
+  if aValid != bValid:
+    return false
+  not aValid or a.links[int(al) - 1] == b.links[int(bl) - 1]
+
 func sameCellUnchecked*(a: Buffer, ac: Cell, b: Buffer,
     bc: Cell): bool {.inline.} =
   ## Compares two cells that belong to `a` and `b` without index checks.
+  ## Links compare by URI because each buffer owns its own link table.
   if ac.rune != bc.rune or ac.style != bc.style or
       ac.wideTail != bc.wideTail:
     return false
   if ac.displayWidth != bc.displayWidth and ac.cellWidth != bc.cellWidth:
+    return false
+  if (ac.link != 0 or bc.link != 0) and not sameLink(a, ac.link, b, bc.link):
     return false
   if ac.glyphLen == 0 and bc.glyphLen == 0:
     return true
@@ -326,12 +364,38 @@ proc writeStr*(b: var Buffer, x, y: int, value: string,
     let safe = sanitizeText(value, policy)
     b.writeSpans(x, y, safe.toOpenArray(0, safe.len - 1), style)
 
+proc internLink*(b: var Buffer, uri: string): uint16 =
+  ## Returns the link id for `uri` in this buffer, adding it when new. Empty,
+  ## oversized, or surplus URIs get id zero, which draws as plain text.
+  if uri.len == 0 or uri.len > maxLinkBytes:
+    return 0
+  for index, known in b.links:
+    if known == uri:
+      return uint16(index + 1)
+  if b.links.len >= maxLinksPerFrame:
+    return 0
+  b.links.add uri
+  uint16(b.links.len)
+
+proc linkCells*(b: var Buffer, x, y, width: int, link: uint16) =
+  ## Attaches link `link` to the cells `x ..< x + width` of row `y` without
+  ## touching their glyphs or styles.
+  if y < 0 or y >= b.height or width <= 0:
+    return
+  let first = max(0, x)
+  let last = min(b.width, x + width)
+  let base = y * b.width
+  for column in first ..< last:
+    b.cells[base + column].link = link
+
 proc reset*(b: var Buffer, style = styleDefault()) =
-  ## Clears every cell, drops any scroll hint, and reuses the complex-glyph
-  ## arena capacity.
+  ## Clears every cell, drops any scroll hint, links, and image placements,
+  ## and reuses the complex-glyph arena capacity.
   b.glyphArena.setLen 0
   b.scrollHint = ScrollHint()
   b.scrollHintConflict = false
+  b.links.setLen 0
+  b.images.setLen 0
   let blank = blankCell(style)
   for cell in b.cells.mitems:
     cell = blank
@@ -385,8 +449,12 @@ proc copyCellFrom(dest: var Buffer, dx, dy: int, source: Buffer,
   let width = cell.cellWidth
   if dx < 0 or dy < 0 or dx + width > dest.width or dy >= dest.height:
     return
+  let link = if cell.link == 0: 0'u16
+    else: dest.internLink(source.linkUri(cell.link))
   if cell.glyphLen == 0:
-    dest.setCell(dx, dy, cell)
+    var simple = cell
+    simple.link = link
+    dest.setCell(dx, dy, simple)
     return
   let first = int(cell.glyphOffset)
   let last = first + int(cell.glyphLen)
@@ -396,6 +464,7 @@ proc copyCellFrom(dest: var Buffer, dx, dy: int, source: Buffer,
   if width == 2:
     dest.repairAt(dx + 1, dy)
   var head = cell
+  head.link = link
   head.glyphOffset = uint32(dest.glyphArena.len)
   dest.glyphArena.add source.glyphArena.toOpenArray(first, last - 1)
   dest.cells[dy * dest.width + dx] = head
@@ -430,6 +499,20 @@ proc clear*(b: var Buffer, rect: Rect, style = styleDefault()) =
     let base = y * b.width
     for x in clipped.x ..< clipped.x + clipped.width:
       b.cells[base + x] = blank
+
+proc placeImage*(b: var Buffer, imageId: uint32, x, y, cols, rows: int) =
+  ## Reserves a `cols` by `rows` cell box at `x`, `y` for image `imageId`:
+  ## the cells become blank and the visible part is recorded as a placement.
+  ## Boxes entirely outside the buffer and zero-sized boxes are ignored.
+  if imageId == 0 or cols <= 0 or rows <= 0:
+    return
+  let visible = intersection(initRect(x, y, cols, rows),
+    initRect(0, 0, b.width, b.height))
+  if visible.isEmpty:
+    return
+  b.clear(visible)
+  b.images.add ImagePlacement(imageId: imageId, rect: visible, cols: cols,
+    rows: rows, offsetX: visible.x - x, offsetY: visible.y - y)
 
 proc restyle*(b: var Buffer, rect: Rect, style: Style) =
   ## Restyles every cell inside `rect` without changing its glyph; used for

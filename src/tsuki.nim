@@ -531,7 +531,7 @@ proc runTsuki*(arguments: seq[string]): int =
       "No model is selected. Use /model or " &
       "start with --model <id>.")
 
-  let uiSink = chat.tuiEventSink()
+  let uiSink = chat.tuiEventSink(workspace)
   proc controllerSink(event: ControllerEvent) {.gcsafe.} =
     uiSink(event)
     if event.kind == controllerSessionsChanged:
@@ -566,7 +566,10 @@ proc runTsuki*(arguments: seq[string]): int =
     directory: workspace, reasoningEffort: session.reasoningEffort),
     selectorEntries = availableSelectors,
     authEntries = startupAuth,
-    sessionEntries = currentListed.sessionEntries)
+    sessionEntries = currentListed.sessionEntries,
+    imageLoader = if getEnv("TSUKI_IMAGES").toLowerAscii in ["0", "off",
+        "false"]: nil
+      else: previewLoader(workspace))
 
   activeHost = cast[ptr HostState](allocShared0(sizeof(HostState)))
   activeHost[].controller = controller
@@ -726,10 +729,9 @@ proc runTsuki*(arguments: seq[string]): int =
         authAdapter = activeHost.hostAdapters.findAdapterKind(
           "codex_app_server")
       if authAdapter.isNil:
-        let label = if action.kind == aaLogin: "sign in" else: "sign out"
+        let label = if action.kind == aaLogin: "signing in" else: "signing out"
         discard chat.post notice("chatgpt-provider-missing",
-          "Add an enabled ChatGPT Codex provider before using /" & label &
-          ".")
+          "Add an enabled ChatGPT Codex provider before " & label & ".")
       else:
         let commandKind = if action.kind == aaLogin: commandLogin
           else: commandLogout

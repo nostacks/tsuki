@@ -3,9 +3,25 @@
 import std/[strutils, unicode]
 import ../[event, geometry, graphemes, render, scroll, style, text]
 import ../widgets/display
-import diffview, markdown, model, theme, toolcall
+import diffview, highlight, markdown, model, theme, toolcall
 
 type
+  ImageInfo* = object
+    ## A host-registered image: its `Frame.image` id and pixel size. An id
+    ## of zero means the host cannot show it and the text fallback draws.
+    id*: uint32
+    widthPx*: int
+    heightPx*: int
+
+  ImageResolver* = proc (source: string): ImageInfo {.closure.}
+
+  ImageBox = object
+    line: int
+    extra: bool
+    id: uint32
+    cols: int
+    rows: int
+
   TranscriptCacheEntry = object
     id: string
     version: uint64
@@ -22,11 +38,15 @@ type
     stableRows: int
     extra: Text
     extraRows: seq[int]
+    boxes: seq[ImageBox]
 
   TranscriptState* = object
     ## Layout and interaction state. Cached offsets make visible-range lookup
     ## logarithmic and rendering proportional to the visible page.
     scroll*: ScrollState
+    imageResolver*: ImageResolver
+      ## Resolves image sources to registered images. Nil keeps every image
+      ## as its text fallback.
     selected*: int
     search*: string
     matches*: seq[int]
@@ -42,6 +62,9 @@ type
 const
   itemGap = 1
   unboundedMarkdown = high(int) div 4
+  maxImageCols = 64
+  maxImageRows = 24
+  pixelsPerCol = 10
 
 func thinkingColors(colors: AgentTheme): AgentTheme =
   result = colors
@@ -130,34 +153,83 @@ func containsIgnoreCase(value, needle: string): bool =
     if index == needle.len: return true
   false
 
+func imageBox(info: ImageInfo, width: int): tuple[cols, rows: int] =
+  ## Cell box for an image: about ten pixels per column, a two-to-one cell
+  ## aspect, never wider than the body or the caps.
+  let limit = min(width, maxImageCols)
+  if limit < 1 or info.widthPx <= 0 or info.heightPx <= 0:
+    return (0, 0)
+  var cols = clamp((info.widthPx + pixelsPerCol - 1) div pixelsPerCol,
+    1, limit)
+  var rows = max(1, (cols * info.heightPx + info.widthPx) div
+    (2 * info.widthPx))
+  if rows > maxImageRows:
+    rows = maxImageRows
+    cols = clamp(rows * 2 * info.widthPx div info.heightPx, 1, limit)
+  (cols, rows)
+
+proc dropBoxes(entry: var TranscriptCacheEntry, extra: bool, fromLine: int) =
+  var kept: seq[ImageBox]
+  for box in entry.boxes:
+    if box.extra != extra or box.line < fromLine:
+      kept.add box
+  entry.boxes = kept
+
+proc rowsOf(entry: var TranscriptCacheEntry, line: Line, index, width: int,
+    resolver: ImageResolver, extra: bool): int =
+  ## Rows one logical line takes: an image block plus its caption when the
+  ## host resolves the image, otherwise the wrapped fallback text.
+  if line.image.source.len > 0 and not resolver.isNil:
+    let info = resolver(line.image.source)
+    if info.id != 0:
+      let box = imageBox(info, width)
+      if box.rows > 0:
+        entry.boxes.add ImageBox(line: index, extra: extra, id: info.id,
+          cols: box.cols, rows: box.rows)
+        return box.rows + line.lineHeight(width)
+  line.lineHeight(width)
+
 proc measureLines(entry: var TranscriptCacheEntry, lines: seq[Line],
-    stable, width: int): int =
+    stable, width: int, resolver: ImageResolver): int =
   if entry.stableMeasured > stable or entry.lineRows.len < entry.stableMeasured:
     entry.stableMeasured = 0
     entry.stableRows = 0
+  entry.dropBoxes(false, entry.stableMeasured)
   entry.lineRows.setLen(lines.len)
   while entry.stableMeasured < stable:
-    let rows = lines[entry.stableMeasured].lineHeight(width)
+    let rows = entry.rowsOf(lines[entry.stableMeasured], entry.stableMeasured,
+      width, resolver, false)
     entry.lineRows[entry.stableMeasured] = rows
     inc entry.stableRows, rows
     inc entry.stableMeasured
   result = entry.stableRows
   for index in stable ..< lines.len:
-    let rows = lines[index].lineHeight(width)
+    let rows = entry.rowsOf(lines[index], index, width, resolver, false)
     entry.lineRows[index] = rows
     inc result, rows
 
-proc extraText(item: TranscriptItem): string =
+func previewable(attachment: Attachment): bool =
+  attachment.source.len > 0 and attachment.state in {attachmentViewReady,
+    attachmentViewSending, attachmentViewSent}
+
+proc extraDocument(item: TranscriptItem, colors: AgentTheme): Text =
+  ## Citations, attachments, and the interrupted marker below a message.
   for citation in item.citations:
-    result.add "[" & citation.label & "](" & citation.uri & ")\n"
+    result.lines.add Line(spans: @[Span(text: citation.label,
+      style: colors.link, hyperlink: Hyperlink(uri: citation.uri))])
   for attachment in item.attachments:
-    result.add "Attachment: " & attachment.name & " (" &
-      attachment.mediaType & ", " & $attachment.sizeBytes & " bytes)\n"
-  if item.partial: result.add "… interrupted\n"
-  if result.len > 0: result.setLen(result.len - 1)
+    var line = Line(spans: @[Span(text: "Attachment: " & attachment.name &
+      " (" & attachment.mediaType & ", " & $attachment.sizeBytes &
+      " bytes)", style: colors.caption)])
+    if attachment.previewable:
+      line.image = ImageRef(source: attachment.source, alt: attachment.name)
+    result.lines.add line
+  if item.partial:
+    result.lines.add Line(spans: @[Span(text: "… interrupted",
+      style: colors.base.muted)])
 
 proc rebuildMessage(entry: var TranscriptCacheEntry, item: TranscriptItem,
-    width: int, colors: AgentTheme) =
+    width: int, colors: AgentTheme, resolver: ImageResolver) =
   let user = item.role == roleUser and item.kind == transcriptMessage
   let bodyWidth = if item.kind == transcriptMessage and not user: width
     else: max(1, width - 2)
@@ -170,7 +242,8 @@ proc rebuildMessage(entry: var TranscriptCacheEntry, item: TranscriptItem,
     entry.document = userDocument(item.content, theme)
     entry.stableMeasured = 0
     entry.stableRows = 0
-    bodyRows = entry.measureLines(entry.document.lines, 0, bodyWidth)
+    bodyRows = entry.measureLines(entry.document.lines, 0, bodyWidth,
+      resolver)
   else:
     let appended = entry.streaming and sameLayout and
       entry.rewrites == item.rewrites and item.content.len >= entry.fedBytes
@@ -190,12 +263,13 @@ proc rebuildMessage(entry: var TranscriptCacheEntry, item: TranscriptItem,
       entry.stableMeasured = 0
       entry.stableRows = 0
     bodyRows = entry.measureLines(entry.markdown.document.lines,
-      entry.markdown.stableLines, bodyWidth)
-  let extras = item.extraText
-  entry.extra = if extras.len > 0: parseMarkdown(extras, theme) else: Text()
+      entry.markdown.stableLines, bodyWidth, resolver)
+  entry.extra = item.extraDocument(theme)
+  entry.dropBoxes(true, 0)
   entry.extraRows.setLen(entry.extra.lines.len)
   for index, line in entry.extra.lines:
-    entry.extraRows[index] = line.lineHeight(bodyWidth)
+    entry.extraRows[index] = entry.rowsOf(line, index, bodyWidth, resolver,
+      true)
     inc bodyRows, entry.extraRows[index]
   entry.bodyRows = max(1, bodyRows)
   entry.height = entry.bodyRows + itemGap
@@ -270,7 +344,8 @@ proc syncLayout*(state: var TranscriptState, chat: AgentChat,
         state.cache[index].width != safeWidth:
       case item.kind
       of transcriptMessage, transcriptThinking:
-        state.cache[index].rebuildMessage(item, safeWidth, colors)
+        state.cache[index].rebuildMessage(item, safeWidth, colors,
+          state.imageResolver)
       of transcriptTool:
         state.cache[index].rebuildTool(item, safeWidth)
       of transcriptNotice, transcriptError, transcriptApproval:
@@ -374,10 +449,11 @@ func selectedText*(state: TranscriptState, chat: AgentChat): string =
     ""
 
 proc drawWrapped(frame: Frame, text: openArray[char], style: Style,
-    used, row: var int, skip, y: int) =
+    used, row: var int, skip, y: int, link = 0'u16) =
   ## Draws one span's clusters continuing at column `used` of visual row
   ## `row`, wrapping exactly like `lineHeight` and omitting rows before
-  ## `skip`. Each cluster is measured once and written directly.
+  ## `skip`. Each cluster is measured once and written directly; a nonzero
+  ## `link` attaches that hyperlink to every written cell.
   let width = frame.rect.width
   if width <= 0:
     return
@@ -392,6 +468,8 @@ proc drawWrapped(frame: Frame, text: openArray[char], style: Style,
         if row >= skip:
           frame.writeAsciiRun(used, y + row - skip,
             text.toOpenArray(start, start + take - 1), style)
+          if link != 0:
+            frame.linkCells(used, y + row - skip, take, link)
         inc used, take
         inc start, take
       continue
@@ -403,6 +481,8 @@ proc drawWrapped(frame: Frame, text: openArray[char], style: Style,
       if row >= skip:
         frame.writeCluster(used, y + row - skip,
           text.toOpenArray(run.a, run.b), clusterWidth, style)
+        if link != 0:
+          frame.linkCells(used, y + row - skip, clusterWidth, link)
       inc used, clusterWidth
 
 proc finishRows(rows: int, skip: var int, y: var int) =
@@ -418,7 +498,9 @@ proc drawLine(frame: Frame, line: Line, skip: var int, y: var int) =
   var used = 0
   var row = 0
   for span in line.spans:
-    frame.drawWrapped(span.text, span.style, used, row, skip, y)
+    let link = if span.hyperlink.uri.len > 0:
+      frame.link(span.hyperlink.uri) else: 0'u16
+    frame.drawWrapped(span.text, span.style, used, row, skip, y, link)
   finishRows(row + 1, skip, y)
 
 proc drawText(frame: Frame, text: openArray[char], style: Style,
@@ -429,14 +511,33 @@ proc drawText(frame: Frame, text: openArray[char], style: Style,
   frame.drawWrapped(text, style, used, row, skip, y)
   finishRows(row + 1, skip, y)
 
+func findBox(boxes: seq[ImageBox], line: int, extra: bool): int =
+  for index, box in boxes:
+    if box.line == line and box.extra == extra:
+      return index
+  -1
+
 proc drawLines(frame: Frame, lines: seq[Line], rows: seq[int],
-    skip: var int, y: var int) =
+    skip: var int, y: var int, boxes: seq[ImageBox], extra: bool) =
+  ## Draws logical lines from the first visible row on. A line with an
+  ## image box places the image, possibly cut by the top edge, and draws
+  ## its caption beneath.
   var index = 0
   while index < lines.len and index < rows.len and skip >= rows[index]:
     dec skip, rows[index]
     inc index
   while index < lines.len and y < frame.rect.height:
-    frame.drawLine(lines[index], skip, y)
+    let box = boxes.findBox(index, extra)
+    if box < 0:
+      frame.drawLine(lines[index], skip, y)
+    else:
+      frame.image(0, y - skip, boxes[box].cols, boxes[box].rows,
+        boxes[box].id)
+      var captionSkip = max(0, skip - boxes[box].rows)
+      var captionY = y + max(0, boxes[box].rows - skip)
+      frame.drawLine(lines[index], captionSkip, captionY)
+      y = captionY
+      skip = 0
     inc index
 
 proc drawMessage(frame: Frame, item: TranscriptItem,
@@ -457,10 +558,13 @@ proc drawMessage(frame: Frame, item: TranscriptItem,
   var skip = skipRows
   var y = 0
   if entry.streaming:
-    body.drawLines(entry.markdown.document.lines, entry.lineRows, skip, y)
+    body.drawLines(entry.markdown.document.lines, entry.lineRows, skip, y,
+      entry.boxes, false)
   else:
-    body.drawLines(entry.document.lines, entry.lineRows, skip, y)
-  body.drawLines(entry.extra.lines, entry.extraRows, skip, y)
+    body.drawLines(entry.document.lines, entry.lineRows, skip, y,
+      entry.boxes, false)
+  body.drawLines(entry.extra.lines, entry.extraRows, skip, y, entry.boxes,
+    true)
 
 proc drawToolOutput(frame: Frame, item: TranscriptItem,
     entry: TranscriptCacheEntry, skipRows: int, colors: AgentTheme) =
@@ -473,6 +577,8 @@ proc drawToolOutput(frame: Frame, item: TranscriptItem,
     frame.rect.height))
   let codeStyle = if item.language.len > 0: colors.base.code
     else: colors.base.muted
+  let highlighted = not diff and item.language.knownLanguage
+  var syntax: HighlightState
   var skip = skipRows
   var y = 0
   var index = 0
@@ -486,11 +592,15 @@ proc drawToolOutput(frame: Frame, item: TranscriptItem,
     if diff:
       let line = item.content[span.start ..< span.stop]
       let styled = line.diffStyle(colors)
-      let text = if line.len > 0 and line[0] in {'+', '-'}:
-        line[1 ..< line.len] else: line
+      let text = if styled.cue != "·" and line.len > 0 and
+          line[0] in {'+', '-'}: line[1 ..< line.len] else: line
       body.write(0, y, (styled.cue & " " & text).truncateCells(
         body.rect.width, true), styled.style)
       inc y
+    elif highlighted:
+      let rich = highlightLine(item.content[span.start ..< span.stop],
+        item.language, syntax, colors, codeStyle)
+      body.drawLine(rich, skip, y)
     else:
       body.drawText(item.content.toOpenArray(span.start, span.stop - 1),
         codeStyle, skip, y)

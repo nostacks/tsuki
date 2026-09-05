@@ -1,11 +1,77 @@
 import std/[json, os, strutils, unicode, unittest]
 import tsuki/agent
+import he3
 import he3/agent as agentui
 import he3/terminal
 import he3/protocols/image
 
 proc temporaryRoot(label: string): string =
   getTempDir() / ("tsuki-phase1-" & label & "-" & $generateSessionId())
+
+proc fakePng(width, height: int): string =
+  ## A PNG signature and IHDR are all the preview loader inspects.
+  result = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+  for value in [width, height]:
+    result.add char((value shr 24) and 0xFF)
+    result.add char((value shr 16) and 0xFF)
+    result.add char((value shr 8) and 0xFF)
+    result.add char(value and 0xFF)
+  result.add "\x08\x06\x00\x00\x00"
+  result.add repeat('\x00', 16)
+
+suite "inline preview loading":
+  test "the preview loader confines markdown images and allows attachments":
+    let created = temporaryRoot("preview")
+    createDir(created)
+    let root = expandFilename(created)
+    defer:
+      if dirExists(root): removeDir(root)
+    createDir(root / "workspace")
+    createDir(root / "outside")
+    writeFile(root / "workspace" / "inside.png", fakePng(4, 4))
+    writeFile(root / "outside" / "external.png", fakePng(6, 2))
+    writeFile(root / "workspace" / "notes.txt", "plain text")
+    writeFile(root / "workspace" / "photo.jpg", "\xff\xd8\xff\xe0 not png")
+    let workspace = root / "workspace"
+    let inside = loadPreviewImage(workspace, "inside.png")
+    check inside.png.len > 0 and inside.widthPx == 4 and inside.heightPx == 4
+    check loadPreviewImage(workspace, "../outside/external.png").png.len == 0
+    check loadPreviewImage(workspace, root / "outside" / "external.png")
+      .png.len == 0
+    let external = loadPreviewImage(workspace, attachmentSourcePrefix &
+      (root / "outside" / "external.png"))
+    check external.widthPx == 6 and external.heightPx == 2
+    check loadPreviewImage(workspace, "notes.txt").png.len == 0
+    check loadPreviewImage(workspace, "photo.jpg").png.len == 0
+    check loadPreviewImage(workspace, "missing.png").png.len == 0
+    var served = 0
+    let loader = previewLoader(workspace,
+      proc (source: string): agentui.ImageData {.gcsafe.} =
+      if source == "memory:logo":
+        inc served
+        return agentui.ImageData(png: fakePng(2, 2), widthPx: 2, heightPx: 2)
+      agentui.ImageData())
+    check loader("memory:logo").widthPx == 2 and served == 1
+    check loader("inside.png").widthPx == 4
+
+  test "the bridge marks attachment sources for the preview loader":
+    var session = newSession(generateSessionId(), "/work", ProviderId("p"),
+      ModelId("m"))
+    session.stagedAttachments.add ImageReference(id: AttachmentId("a1"),
+      path: "img/a.png", location: attachmentWorkspaceRelative,
+      displayName: "a.png", mediaType: "image/png", sizeBytes: 10, width: 2,
+      height: 2, state: attachmentReady)
+    session.stagedAttachments.add ImageReference(id: AttachmentId("a2"),
+      path: "/elsewhere/b.png", location: attachmentExternalAbsolute,
+      displayName: "b.png", mediaType: "image/png", sizeBytes: 10, width: 2,
+      height: 2, state: attachmentReady)
+    let chat = agentui.initAgentChat()
+    chat.projectSession(session)
+    check chat.stagedAttachments.len == 2
+    check chat.stagedAttachments[0].source == attachmentSourcePrefix &
+      ("/work" / "img/a.png")
+    check chat.stagedAttachments[1].source == attachmentSourcePrefix &
+      "/elsewhere/b.png"
 
 suite "phase 1 product core":
   test "reasoning metadata survives configuration and caching":

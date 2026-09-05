@@ -32,8 +32,8 @@ proc diffRows*(source: string, colors = agentTheme()): seq[Line] =
   ## row keeps a redundant symbol cue so status never depends on color alone.
   for line in sanitizeText(source).splitLines:
     let styled = line.diffStyle(colors)
-    let body = if line.len > 0 and line[0] in {'+', '-'}:
-      line[1 ..< line.len] else: line
+    let body = if styled.cue != "·" and line.len > 0 and
+        line[0] in {'+', '-'}: line[1 ..< line.len] else: line
     var row = Line()
     row.spans.add Span(text: styled.cue & " ", style: styled.style)
     row.spans.add Span(text: body, style: styled.style)
@@ -47,7 +47,8 @@ proc unified(frame: Frame, lines: seq[string], state: var DiffViewState,
   let last = min(lines.len, first + frame.rect.height)
   for index in first ..< last:
     let styled = lines[index].diffStyle(colors)
-    let body = if lines[index].len > 0 and lines[index][0] in {'+', '-'}:
+    let body = if styled.cue != "·" and lines[index].len > 0 and
+        lines[index][0] in {'+', '-'}:
       lines[index][1 ..< lines[index].len] else: lines[index]
     frame.write(0, index - first,
       (styled.cue & " " & body).truncateCells(frame.rect.width, true),

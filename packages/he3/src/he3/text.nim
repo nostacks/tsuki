@@ -31,9 +31,16 @@ type
     style*: Style
     hyperlink*: Hyperlink
 
+  ImageRef* = object
+    ## An image a line stands for. Views that can show images resolve
+    ## `source` through their host; every other view draws the line's spans.
+    source*: string
+    alt*: string
+
   Line* = object
-    ## One logical line of rich text.
+    ## One logical line of rich text, optionally standing for an image.
     spans*: seq[Span]
+    image*: ImageRef
 
   Text* = object
     ## Versioned rich text suitable for cached measurement and wrapping.
