@@ -466,6 +466,30 @@ proc testAgentShell =
     check grown.composer.height == 3 and grown.composer.y == 19,
       "the composer grows for multiline drafts and the divider stays put"
 
+  block userBand:
+    let chat = seededShellChat()
+    var harness = initHeadlessTui(80, 24)
+    var state = initAgentUiState()
+    state.transcript.scroll.anchor = anchorEnd
+    let rows = harness.drawShell(chat, state, options).shellRows
+    let band = agentTheme().userMessage.bg
+    check band.kind != ckDefault,
+      "the default theme paints a surface behind user requests"
+    var userRow = -1
+    var replyRow = -1
+    for y, row in rows:
+      if row.contains("›"): userRow = y
+      if row.contains("I found the function."): replyRow = y
+    check userRow >= 0 and replyRow >= 0, "both sides of the exchange render"
+    let cueX = rows[userRow].find("›")
+    check harness.buffer.cellAt(cueX, userRow).style.bg == band and
+      harness.buffer.cellAt(cueX + 2, userRow).style.bg == band,
+      "the cue and the request text share the painted band"
+    check harness.buffer.cellAt(60, userRow).style.bg == band,
+      "the band extends past the end of the request text"
+    check harness.buffer.cellAt(cueX + 2, replyRow).style.bg != band,
+      "assistant output stays on the unpainted canvas"
+
   block narrow40x12:
     let chat = seededShellChat()
     var harness = initHeadlessTui(40, 12)

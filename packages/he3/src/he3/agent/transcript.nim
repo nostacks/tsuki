@@ -76,7 +76,7 @@ func thinkingColors(colors: AgentTheme): AgentTheme =
 func userDocument(content: string, colors: AgentTheme): Text =
   for line in content.splitLines:
     var row = Line()
-    row.spans.add Span(text: line, style: colors.base.text)
+    row.spans.add Span(text: line, style: colors.userMessage)
     result.lines.add row
 
 func looksLikeDiff(item: TranscriptItem): bool =
@@ -265,6 +265,10 @@ proc rebuildMessage(entry: var TranscriptCacheEntry, item: TranscriptItem,
     bodyRows = entry.measureLines(entry.markdown.document.lines,
       entry.markdown.stableLines, bodyWidth, resolver)
   entry.extra = item.extraDocument(theme)
+  if user:
+    for line in entry.extra.lines.mitems:
+      for span in line.spans.mitems:
+        span.style = span.style.withBg(theme.userMessage.bg)
   entry.dropBoxes(true, 0)
   entry.extraRows.setLen(entry.extra.lines.len)
   for index, line in entry.extra.lines:
@@ -550,6 +554,9 @@ proc drawMessage(frame: Frame, item: TranscriptItem,
     else: ""
   let cueStyle = if item.role == roleUser: colors.userLabel
     else: colors.thinkingLabel
+  if item.role == roleUser:
+    frame.fill(rect(0, 0, frame.rect.width, frame.rect.height), Rune(0x0020),
+      colors.userMessage)
   if cue.len > 0 and skipRows == 0:
     frame.write(0, 0, cue, cueStyle)
   let bodyX = if indented: 2 else: 0

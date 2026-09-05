@@ -32,7 +32,7 @@ Terminal, cmd.exe conhost.
 | # | Check | How |
 |---|-------|-----|
 | 1 | Clean enter | Alt screen starts on the quiet baseline: 月 tsuki welcome, help line, one-row composer below a blank gap, status |
-| 2 | Submit | Type text, press Enter; the request appears under a violet `›` cue |
+| 2 | Submit | Type text, press Enter; the request appears under a violet `›` cue on a shaded full-width band |
 | 3 | Streaming | Thinking (`✻`), plan row, tool rows, and the final response advance across multiple frames |
 | 4 | Tool output | Read/code output renders with a `│` rail; patch output renders through the diff view with `+`/`−` cues |
 | 5 | Approval gate | The turn pauses on an inline card at the bottom of the transcript with `Reject` selected before any input |
